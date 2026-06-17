@@ -179,15 +179,16 @@ Schema:
 
 Behavior:
 
-- Clear all cookies in the current browser context, including `HttpOnly`
-  cookies. This is not scoped to the selected page: it clears cookies for all
-  sites and pages that share the current browser context.
+- Clear cookies that affect the selected page's HTTP(S) frame URLs, including
+  `HttpOnly` cookies. This mirrors the DevTools Application panel concept of
+  cookies used by the current page's frames.
 - Clear browser HTTP cache.
-- Clear all persistent storage for the selected page's origin through CDP
+- Clear all persistent storage for the selected page's HTTP(S) frame origins
+  through CDP
   `Storage.clearDataForOrigin` with `storageTypes: "all"`. This covers
   localStorage, IndexedDB, Cache Storage, Service Workers, WebSQL, file systems,
   storage buckets, shared storage, and related CDP-supported origin data.
-- Clear current page sessionStorage.
+- Clear sessionStorage in the selected page's HTTP(S) frames.
 - Do not reload.
 
 Rationale:
@@ -197,6 +198,10 @@ Rationale:
 - Leaving localStorage, IndexedDB, Cache Storage, or Service Workers behind can
   cause the next replay to differ from a fresh visit.
 - The model should not choose cookie names, domains, paths, or storage types.
+- Cookie cleanup should not wipe unrelated pages' cookies. It should only remove
+  cookies that match the current page's frame URLs. If another page shares the
+  same cookie domain/path scope, that shared login state can still be affected
+  because cookies are not page-owned objects.
 - Reload remains a separate explicit navigation action.
 
 Implementation requirements:
@@ -204,12 +209,15 @@ Implementation requirements:
 - Derive the target URL from the selected page.
 - Reject pages without a normal HTTP(S) origin, such as `about:blank`, `data:`,
   and `file:`, with a clear error.
-- Clear cookies through the browser context, not through page JavaScript, using
-  `browserContext.clearCookies()` with no filters.
+- Derive HTTP(S) frame URLs from the selected page.
+- Use `browserContext.cookies(frameUrls)` to find cookies that affect the
+  current page's frames.
+- Clear matched cookies through the browser context, not through page
+  JavaScript, using exact `name`, `domain`, and `path` filters.
 - Clear browser HTTP cache through CDP `Network.clearBrowserCache`.
-- Clear selected-origin persistent storage through CDP
+- Clear each selected frame origin's persistent storage through CDP
   `Storage.clearDataForOrigin`.
-- Clear sessionStorage with a page evaluation against the current page.
+- Clear sessionStorage with frame evaluations against selected HTTP(S) frames.
 - Run cleanup best-effort: if one cleanup step fails, continue with the
   remaining steps.
 - Return a concise summary of what was actually cleared and any warnings.
@@ -219,14 +227,18 @@ Example response:
 ```text
 Browser state cleanup completed for https://www.example.com
 URL: https://www.example.com/login
+Frame origins targeted: https://www.example.com, https://accounts.example-cdn.com
 
-Cookies cleared: yes
+Cookies cleared: yes (42 matching cookies)
 Cookies found before clearing: 42
 Cookie domains: example.com, google.com, doubleclick.net
 Cookie names: _abck, bm_sz, session_id
 Browser HTTP cache cleared: yes
-Origin storage cleared: yes (Storage.clearDataForOrigin all)
-Session storage cleared: yes
+Origin storage cleared: 2/2 origins
+Origin storage cleared for: https://www.example.com, https://accounts.example-cdn.com
+Origin storage failed for: none
+Session storage cleared: 2/2 frames
+Session storage failed for frames: none
 Warnings:
 none
 
@@ -278,13 +290,15 @@ Network inspection:
 Site state reset:
 
 - `clear_site_data` has no parameters.
-- `clear_site_data` clears all cookies in the current browser context,
-  including `HttpOnly` cookies. Other sites in the same browser context can lose
-  cookie-based login state.
+- `clear_site_data` clears cookies that affect the selected page's HTTP(S)
+  frame URLs, including `HttpOnly` cookies.
+- `clear_site_data` does not clear unrelated cookie scopes. Other pages can only
+  lose cookie-based login state when they share the same cookie domain/path scope
+  as the selected page's frames.
 - `clear_site_data` clears browser HTTP cache.
 - `clear_site_data` clears all persistent storage for the selected page's
-  origin.
-- `clear_site_data` clears current-page sessionStorage.
+  HTTP(S) frame origins.
+- `clear_site_data` clears sessionStorage in selected-page HTTP(S) frames.
 - The tool does not reload.
 - The tool continues clearing what it can if an individual step fails.
 - The tool returns a clear summary of what was actually cleared and any

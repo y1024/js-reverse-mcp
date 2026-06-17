@@ -69,7 +69,7 @@
 
 ### `clear_site_data`
 
-**Description:** Clear browser state to create a clean replay environment for the currently selected page. This clears all cookies for all sites and pages sharing the current browser context, clears browser HTTP cache, clears all persistent storage for the selected page's origin, and clears current page sessionStorage. This tool does not reload the page. Cookie cleanup is browser-context-wide; non-cookie storage cleanup is scoped to the selected page origin.
+**Description:** Clear browser state to create a clean replay environment for the currently selected page. This clears cookies that affect the current page's HTTP(S) frame URLs, clears browser HTTP cache, clears persistent storage for the current page's HTTP(S) frame origins, and clears sessionStorage in current page HTTP(S) frames. This tool does not reload the page. Cookie cleanup is scoped by cookie domain/path matching for the current page frames, not by all cookies in the browser context.
 
 **Parameters:** None
 

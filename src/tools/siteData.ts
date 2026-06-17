@@ -9,6 +9,18 @@ import {defineTool} from './ToolDefinition.js';
 
 const MAX_SUMMARY_ITEMS = 8;
 
+function getHttpUrl(value: string): URL | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      return url;
+    }
+  } catch {
+    return;
+  }
+  return;
+}
+
 function summarizeValues(values: string[]): string {
   const uniqueValues = [...new Set(values)].sort();
   if (uniqueValues.length === 0) {
@@ -26,7 +38,7 @@ function summarizeValues(values: string[]): string {
 
 export const clearSiteData = defineTool({
   name: 'clear_site_data',
-  description: `Clear browser state to create a clean replay environment for the currently selected page. This clears all cookies for all sites and pages sharing the current browser context, clears browser HTTP cache, clears all persistent storage for the selected page's origin, and clears current page sessionStorage. This tool does not reload the page. Cookie cleanup is browser-context-wide; non-cookie storage cleanup is scoped to the selected page origin.`,
+  description: `Clear browser state to create a clean replay environment for the currently selected page. This clears cookies that affect the current page's HTTP(S) frame URLs, clears browser HTTP cache, clears persistent storage for the current page's HTTP(S) frame origins, and clears sessionStorage in current page HTTP(S) frames. This tool does not reload the page. Cookie cleanup is scoped by cookie domain/path matching for the current page frames, not by all cookies in the browser context.`,
   annotations: {
     category: ToolCategory.BROWSER_STATE,
     readOnlyHint: false,
@@ -44,33 +56,64 @@ export const clearSiteData = defineTool({
     }
 
     const browserContext = page.context();
+    const frameUrls = [
+      ...new Map(
+        page
+          .frames()
+          .map(frame => getHttpUrl(frame.url()))
+          .filter((frameUrl): frameUrl is URL => Boolean(frameUrl))
+          .map(frameUrl => [frameUrl.href, frameUrl]),
+      ).values(),
+    ];
+    const frameOrigins = [
+      ...new Map(frameUrls.map(frameUrl => [frameUrl.origin, frameUrl.origin]))
+        .values(),
+    ];
     const warnings: string[] = [];
     let cookieCount: number | undefined;
     let cookieDomains: string[] = [];
     let cookieNames: string[] = [];
     let cookiesStatus = 'failed';
     let browserCacheStatus = 'failed';
-    let originStorageStatus = 'failed';
+    let originStorageStatus = `failed`;
     let sessionStorageStatus = 'failed';
+    const clearedStorageOrigins: string[] = [];
+    const failedStorageOrigins: string[] = [];
+    const clearedSessionStorageFrames: string[] = [];
+    const failedSessionStorageFrames: string[] = [];
 
     try {
-      const cookies = await browserContext.cookies();
+      const cookies = await browserContext.cookies(
+        frameUrls.map(frameUrl => frameUrl.href),
+      );
       cookieCount = cookies.length;
       cookieDomains = cookies.map(cookie => cookie.domain);
       cookieNames = cookies.map(cookie => cookie.name);
-    } catch (error) {
-      warnings.push(
-        `Failed to inspect cookies before clearing: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
 
-    try {
-      await browserContext.clearCookies();
-      cookiesStatus =
-        cookieCount === undefined ? 'yes (count unavailable)' : 'yes';
+      const cookiesByKey = new Map(
+        cookies.map(cookie => [
+          `${cookie.name}\u0000${cookie.domain}\u0000${cookie.path}`,
+          cookie,
+        ]),
+      );
+
+      for (const cookie of cookiesByKey.values()) {
+        await browserContext.clearCookies({
+          name: cookie.name,
+          domain: cookie.domain,
+          path: cookie.path,
+        });
+      }
+
+      cookiesStatus = `yes (${cookiesByKey.size} matching cookies)`;
+      if (cookies.some(cookie => cookie.partitionKey)) {
+        warnings.push(
+          'Some matched cookies are partitioned. Patchright clearCookies filters by name/domain/path, so matching partitioned cookies may be cleared together.',
+        );
+      }
     } catch (error) {
       warnings.push(
-        `Failed to clear cookies: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to inspect or clear cookies for current page frames: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
 
@@ -92,14 +135,24 @@ export const clearSiteData = defineTool({
       }
 
       try {
-        await session.send('Storage.clearDataForOrigin', {
-          origin: url.origin,
-          storageTypes: 'all',
-        });
-        originStorageStatus = 'yes (Storage.clearDataForOrigin all)';
+        for (const origin of frameOrigins) {
+          try {
+            await session.send('Storage.clearDataForOrigin', {
+              origin,
+              storageTypes: 'all',
+            });
+            clearedStorageOrigins.push(origin);
+          } catch (error) {
+            failedStorageOrigins.push(origin);
+            warnings.push(
+              `Failed to clear origin storage for ${origin}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        originStorageStatus = `${clearedStorageOrigins.length}/${frameOrigins.length} origins`;
       } catch (error) {
         warnings.push(
-          `Failed to clear origin storage for ${url.origin}: ${error instanceof Error ? error.message : String(error)}`,
+          `Failed to clear origin storage for current page frames: ${error instanceof Error ? error.message : String(error)}`,
         );
       } finally {
         await session.detach().catch(error => {
@@ -110,21 +163,33 @@ export const clearSiteData = defineTool({
       }
     }
 
-    try {
-      await page.evaluate(() => {
-        sessionStorage.clear();
-      });
-      sessionStorageStatus = 'yes';
-    } catch (error) {
-      warnings.push(
-        `Failed to clear current page sessionStorage: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    for (const frame of page.frames()) {
+      const frameUrl = getHttpUrl(frame.url());
+      if (!frameUrl) {
+        continue;
+      }
+
+      try {
+        await frame.evaluate(() => {
+          sessionStorage.clear();
+        });
+        clearedSessionStorageFrames.push(frameUrl.href);
+      } catch (error) {
+        failedSessionStorageFrames.push(frameUrl.href);
+        warnings.push(
+          `Failed to clear sessionStorage for frame ${frameUrl.href}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
+    sessionStorageStatus = `${clearedSessionStorageFrames.length}/${frameUrls.length} frames`;
 
     response.appendResponseLine(
       `Browser state cleanup completed for ${url.origin}`,
     );
     response.appendResponseLine(`URL: ${pageUrl}`);
+    response.appendResponseLine(
+      `Frame origins targeted: ${summarizeValues(frameOrigins)}`,
+    );
     response.appendResponseLine(`Cookies cleared: ${cookiesStatus}`);
     response.appendResponseLine(
       `Cookies found before clearing: ${cookieCount ?? 'unknown'}`,
@@ -142,7 +207,16 @@ export const clearSiteData = defineTool({
       `Origin storage cleared: ${originStorageStatus}`,
     );
     response.appendResponseLine(
+      `Origin storage cleared for: ${summarizeValues(clearedStorageOrigins)}`,
+    );
+    response.appendResponseLine(
+      `Origin storage failed for: ${summarizeValues(failedStorageOrigins)}`,
+    );
+    response.appendResponseLine(
       `Session storage cleared: ${sessionStorageStatus}`,
+    );
+    response.appendResponseLine(
+      `Session storage failed for frames: ${summarizeValues(failedSessionStorageFrames)}`,
     );
 
     response.appendResponseLine(`Warnings:`);
