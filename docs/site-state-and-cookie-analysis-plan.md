@@ -214,6 +214,8 @@ Implementation requirements:
   current page's frames.
 - Clear matched cookies through the browser context, not through page
   JavaScript, using exact `name`, `domain`, and `path` filters.
+- Clear matched cookies one scope at a time and report matched, cleared, and
+  failed cookie names. Cookie values must not be printed.
 - Clear browser HTTP cache through CDP `Network.clearBrowserCache`.
 - Clear each selected frame origin's persistent storage through CDP
   `Storage.clearDataForOrigin`.
@@ -229,15 +231,21 @@ Browser state cleanup completed for https://www.example.com
 URL: https://www.example.com/login
 Frame origins targeted: https://www.example.com, https://accounts.example-cdn.com
 
-Cookies cleared: yes (42 matching cookies)
+Cookies cleared: 42/42 matching cookie scopes
 Cookies found before clearing: 42
-Cookie domains: example.com, google.com, doubleclick.net
-Cookie names: _abck, bm_sz, session_id
+Cookie domains matched: example.com, google.com, doubleclick.net
+Cookie names matched: _abck, bm_sz, session_id
+Cookie names cleared: _abck, bm_sz, session_id
+Cookie names failed: none
+Cookie scopes cleared: _abck @ .example.com/, bm_sz @ .example.com/, session_id @ www.example.com/
+Cookie scopes failed: none
 Browser HTTP cache cleared: yes
 Origin storage cleared: 2/2 origins
+Origin storage types attempted: all (localStorage, IndexedDB, Cache Storage, Service Workers, WebSQL, file systems, storage buckets, shared storage, and related CDP-supported data)
 Origin storage cleared for: https://www.example.com, https://accounts.example-cdn.com
 Origin storage failed for: none
 Session storage cleared: 2/2 frames
+Session storage cleared for frames: https://www.example.com/login, https://accounts.example-cdn.com/frame
 Session storage failed for frames: none
 Warnings:
 none
@@ -292,6 +300,8 @@ Site state reset:
 - `clear_site_data` has no parameters.
 - `clear_site_data` clears cookies that affect the selected page's HTTP(S)
   frame URLs, including `HttpOnly` cookies.
+- `clear_site_data` reports matched, cleared, and failed cookie names without
+  printing cookie values.
 - `clear_site_data` does not clear unrelated cookie scopes. Other pages can only
   lose cookie-based login state when they share the same cookie domain/path scope
   as the selected page's frames.

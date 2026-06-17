@@ -7,8 +7,6 @@
 import {ToolCategory} from './categories.js';
 import {defineTool} from './ToolDefinition.js';
 
-const MAX_SUMMARY_ITEMS = 8;
-
 function getHttpUrl(value: string): URL | undefined {
   try {
     const url = new URL(value);
@@ -21,19 +19,21 @@ function getHttpUrl(value: string): URL | undefined {
   return;
 }
 
-function summarizeValues(values: string[]): string {
+function formatValues(values: string[]): string {
   const uniqueValues = [...new Set(values)].sort();
   if (uniqueValues.length === 0) {
     return 'none';
   }
 
-  const visibleValues = uniqueValues.slice(0, MAX_SUMMARY_ITEMS);
-  const remaining = uniqueValues.length - visibleValues.length;
-  if (remaining <= 0) {
-    return visibleValues.join(', ');
-  }
+  return uniqueValues.join(', ');
+}
 
-  return `${visibleValues.join(', ')}, ... and ${remaining} more`;
+function formatCookieScope(cookie: {
+  name: string;
+  domain: string;
+  path: string;
+}): string {
+  return `${cookie.name} @ ${cookie.domain}${cookie.path}`;
 }
 
 export const clearSiteData = defineTool({
@@ -81,6 +81,10 @@ export const clearSiteData = defineTool({
     const failedStorageOrigins: string[] = [];
     const clearedSessionStorageFrames: string[] = [];
     const failedSessionStorageFrames: string[] = [];
+    const clearedCookieNames: string[] = [];
+    const failedCookieNames: string[] = [];
+    const clearedCookieScopes: string[] = [];
+    const failedCookieScopes: string[] = [];
 
     try {
       const cookies = await browserContext.cookies(
@@ -98,14 +102,24 @@ export const clearSiteData = defineTool({
       );
 
       for (const cookie of cookiesByKey.values()) {
-        await browserContext.clearCookies({
-          name: cookie.name,
-          domain: cookie.domain,
-          path: cookie.path,
-        });
+        try {
+          await browserContext.clearCookies({
+            name: cookie.name,
+            domain: cookie.domain,
+            path: cookie.path,
+          });
+          clearedCookieNames.push(cookie.name);
+          clearedCookieScopes.push(formatCookieScope(cookie));
+        } catch (error) {
+          failedCookieNames.push(cookie.name);
+          failedCookieScopes.push(formatCookieScope(cookie));
+          warnings.push(
+            `Failed to clear cookie ${formatCookieScope(cookie)}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
 
-      cookiesStatus = `yes (${cookiesByKey.size} matching cookies)`;
+      cookiesStatus = `${clearedCookieScopes.length}/${cookiesByKey.size} matching cookie scopes`;
       if (cookies.some(cookie => cookie.partitionKey)) {
         warnings.push(
           'Some matched cookies are partitioned. Patchright clearCookies filters by name/domain/path, so matching partitioned cookies may be cleared together.',
@@ -188,17 +202,29 @@ export const clearSiteData = defineTool({
     );
     response.appendResponseLine(`URL: ${pageUrl}`);
     response.appendResponseLine(
-      `Frame origins targeted: ${summarizeValues(frameOrigins)}`,
+      `Frame origins targeted: ${formatValues(frameOrigins)}`,
     );
     response.appendResponseLine(`Cookies cleared: ${cookiesStatus}`);
     response.appendResponseLine(
       `Cookies found before clearing: ${cookieCount ?? 'unknown'}`,
     );
     response.appendResponseLine(
-      `Cookie domains: ${summarizeValues(cookieDomains)}`,
+      `Cookie domains matched: ${formatValues(cookieDomains)}`,
     );
     response.appendResponseLine(
-      `Cookie names: ${summarizeValues(cookieNames)}`,
+      `Cookie names matched: ${formatValues(cookieNames)}`,
+    );
+    response.appendResponseLine(
+      `Cookie names cleared: ${formatValues(clearedCookieNames)}`,
+    );
+    response.appendResponseLine(
+      `Cookie names failed: ${formatValues(failedCookieNames)}`,
+    );
+    response.appendResponseLine(
+      `Cookie scopes cleared: ${formatValues(clearedCookieScopes)}`,
+    );
+    response.appendResponseLine(
+      `Cookie scopes failed: ${formatValues(failedCookieScopes)}`,
     );
     response.appendResponseLine(
       `Browser HTTP cache cleared: ${browserCacheStatus}`,
@@ -207,16 +233,22 @@ export const clearSiteData = defineTool({
       `Origin storage cleared: ${originStorageStatus}`,
     );
     response.appendResponseLine(
-      `Origin storage cleared for: ${summarizeValues(clearedStorageOrigins)}`,
+      `Origin storage types attempted: all (localStorage, IndexedDB, Cache Storage, Service Workers, WebSQL, file systems, storage buckets, shared storage, and related CDP-supported data)`,
     );
     response.appendResponseLine(
-      `Origin storage failed for: ${summarizeValues(failedStorageOrigins)}`,
+      `Origin storage cleared for: ${formatValues(clearedStorageOrigins)}`,
+    );
+    response.appendResponseLine(
+      `Origin storage failed for: ${formatValues(failedStorageOrigins)}`,
     );
     response.appendResponseLine(
       `Session storage cleared: ${sessionStorageStatus}`,
     );
     response.appendResponseLine(
-      `Session storage failed for frames: ${summarizeValues(failedSessionStorageFrames)}`,
+      `Session storage cleared for frames: ${formatValues(clearedSessionStorageFrames)}`,
+    );
+    response.appendResponseLine(
+      `Session storage failed for frames: ${formatValues(failedSessionStorageFrames)}`,
     );
 
     response.appendResponseLine(`Warnings:`);
