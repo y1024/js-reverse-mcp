@@ -6,7 +6,11 @@
 
 import {isUtf8} from 'node:buffer';
 
-import {networkRequestObservedAtSymbol} from '../PageCollector.js';
+import {
+  networkRequestObservedAtSymbol,
+  responseBodyCacheSymbol,
+} from '../PageCollector.js';
+import type {CachedResponseBody} from '../PageCollector.js';
 import type {HTTPRequest, HTTPResponse} from '../third_party/index.js';
 
 const BODY_CONTEXT_SIZE_LIMIT = 4096;
@@ -318,35 +322,29 @@ export async function getFormattedResponseBody(
   httpResponse: HTTPResponse,
   sizeLimit = BODY_CONTEXT_SIZE_LIMIT,
 ): Promise<string | undefined> {
-  try {
-    const responseBuffer = await withTimeout(
-      httpResponse.body(),
-      BODY_FETCH_TIMEOUT_MS,
-    );
+  const read = await readResponseBody(httpResponse);
+  if (!read.ok) {
+    return `<${read.error}>`;
+  }
+  const responseBuffer = read.buffer;
 
-    if (isUtf8(responseBuffer)) {
-      const responseAsTest = responseBuffer.toString('utf-8');
-      const contentType = getHeaderValue(
-        httpResponse.headers(),
-        'content-type',
-      );
+  if (isUtf8(responseBuffer)) {
+    const responseAsTest = responseBuffer.toString('utf-8');
+    const contentType = getHeaderValue(httpResponse.headers(), 'content-type');
 
-      if (responseAsTest.length === 0) {
-        return `<empty response>`;
-      }
-
-      return getFormattedTextBody(
-        responseAsTest,
-        contentType,
-        sizeLimit,
-        'responseBody',
-      );
+    if (responseAsTest.length === 0) {
+      return `<empty response>`;
     }
 
-    return `<binary data>`;
-  } catch {
-    return `<not available anymore>`;
+    return getFormattedTextBody(
+      responseAsTest,
+      contentType,
+      sizeLimit,
+      'responseBody',
+    );
   }
+
+  return `<binary data>`;
 }
 
 export async function getFormattedRequestBody(
@@ -1047,18 +1045,54 @@ function getSetCookieName(setCookieHeader: string): string {
   return setCookieHeader.slice(0, eq).trim() || '<unnamed>';
 }
 
+type RequestWithBodyCache = HTTPRequest & {
+  [responseBodyCacheSymbol]?: Promise<CachedResponseBody>;
+};
+
+/**
+ * Read the response body eagerly cached at `requestfinished` time, if any.
+ * Returns undefined when no capture was started (e.g. pending request).
+ */
+async function getCachedBody(
+  httpResponse: HTTPResponse,
+): Promise<CachedResponseBody | undefined> {
+  try {
+    const request = httpResponse.request() as RequestWithBodyCache;
+    const cached = request[responseBodyCacheSymbol];
+    return cached ? await cached : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function readResponseBody(
   httpResponse: HTTPResponse,
 ): Promise<ResponseBodyRead> {
+  // Prefer the body captured before any navigation could evict it.
+  const cached = await getCachedBody(httpResponse);
+  if (cached?.ok === true) {
+    return {ok: true, buffer: cached.buffer};
+  }
+
+  // Fall back to a live fetch. This still succeeds for current-navigation or
+  // small responses; for bodies the cache deliberately skipped (too large), it
+  // also recovers the full body as long as the loader is still alive.
   try {
     return {
       ok: true,
       buffer: await withTimeout(httpResponse.body(), BODY_FETCH_TIMEOUT_MS),
     };
   } catch (error) {
+    const liveError = error instanceof Error ? error.message : String(error);
+    if (cached?.ok === 'skipped') {
+      return {
+        ok: false,
+        error: `not cached (${cached.reason}); export with outputFile to fetch the full body. live fetch failed: ${liveError}`,
+      };
+    }
     return {
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: 'not available anymore — body evicted after navigation',
     };
   }
 }

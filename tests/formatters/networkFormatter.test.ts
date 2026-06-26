@@ -10,11 +10,17 @@ import {test} from 'node:test';
 import {
   exportNetworkRequestPart,
   getFormattedHeaderEntries,
+  getFormattedResponseBody,
   getShortDescriptionForRequestAsync,
   getStatusFromRequestAsync,
   headersContainSensitiveValues,
 } from '../../src/formatters/networkFormatter.js';
-import type {HTTPRequest} from '../../src/third_party/index.js';
+import {responseBodyCacheSymbol} from '../../src/PageCollector.js';
+import type {CachedResponseBody} from '../../src/PageCollector.js';
+import type {
+  HTTPRequest,
+  Response as HTTPResponse,
+} from '../../src/third_party/index.js';
 
 test('redacts sensitive inline header values', () => {
   const lines = getFormattedHeaderEntries([
@@ -92,6 +98,87 @@ test('allows pending request-side exports', async () => {
   const queryParams = await exportNetworkRequestPart(request, 'queryParams');
   assert.match(Buffer.from(queryParams.data).toString('utf8'), /"a": "1"/);
 });
+
+test('reads the eagerly cached body after the live body was evicted', async () => {
+  // body() throws to simulate the browser evicting the body after navigation;
+  // the cache captured at requestfinished time must still serve it.
+  const response = createFinishedResponse({
+    bodyThrows: true,
+    contentType: 'application/json',
+    cache: {ok: true, buffer: Buffer.from('{"token":"abc"}')},
+  });
+
+  const out = await getFormattedResponseBody(response);
+  assert.ok(out);
+  assert.match(out, /"token":"abc"/);
+});
+
+test('reports body eviction when neither cache nor live body is available', async () => {
+  const response = createFinishedResponse({bodyThrows: true});
+
+  assert.equal(
+    await getFormattedResponseBody(response),
+    '<not available anymore — body evicted after navigation>',
+  );
+});
+
+test('explains skipped-cache fallback when the body was too large to cache', async () => {
+  const response = createFinishedResponse({
+    bodyThrows: true,
+    cache: {ok: 'skipped', reason: 'body 9000000 bytes exceeds cache limit'},
+  });
+
+  const out = await getFormattedResponseBody(response);
+  assert.ok(out);
+  assert.match(out, /not cached/);
+  assert.match(out, /export with outputFile/);
+});
+
+test('falls back to a live body fetch when nothing was cached', async () => {
+  const response = createFinishedResponse({
+    bodyBuffer: Buffer.from('hello world'),
+    contentType: 'text/plain',
+  });
+
+  const out = await getFormattedResponseBody(response);
+  assert.ok(out);
+  assert.match(out, /hello world/);
+});
+
+function createFinishedResponse(opts: {
+  bodyBuffer?: Buffer;
+  bodyThrows?: boolean;
+  contentType?: string;
+  cache?: CachedResponseBody;
+}): HTTPResponse {
+  const request = {
+    failure: () => null,
+  } as unknown as HTTPRequest & {
+    response: () => Promise<HTTPResponse>;
+    [responseBodyCacheSymbol]?: Promise<CachedResponseBody>;
+  };
+
+  const response = {
+    request: () => request,
+    status: () => 200,
+    headers: () => ({
+      'content-type': opts.contentType ?? 'application/json',
+    }),
+    body: async () => {
+      if (opts.bodyThrows) {
+        throw new Error('No resource with given identifier found');
+      }
+      return opts.bodyBuffer ?? Buffer.from('');
+    },
+  } as unknown as HTTPResponse;
+
+  request.response = async () => response;
+  if (opts.cache) {
+    request[responseBodyCacheSymbol] = Promise.resolve(opts.cache);
+  }
+
+  return response;
+}
 
 function createPendingRequest(): HTTPRequest {
   return {

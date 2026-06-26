@@ -130,6 +130,35 @@ export const stableIdSymbol = Symbol('stableIdSymbol');
 export const networkRequestObservedAtSymbol = Symbol(
   'networkRequestObservedAtSymbol',
 );
+
+/**
+ * Caches the response body buffer eagerly captured at `requestfinished` time,
+ * before a subsequent navigation lets the browser evict it. Stored as a
+ * Promise so concurrent readers dedupe onto a single capture. Lives on the
+ * request object, so it is GC'd together with the request when its navigation
+ * bucket is dropped.
+ */
+export const responseBodyCacheSymbol = Symbol('responseBodyCacheSymbol');
+
+export type CachedResponseBody =
+  | {ok: true; buffer: Buffer}
+  | {ok: false; error: string}
+  | {ok: 'skipped'; reason: string};
+
+/**
+ * Per-response size cap. Responses larger than this are not cached (they would
+ * dominate memory); reads fall back to a live fetch instead.
+ */
+export const MAX_CACHED_BODY_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Per-page total budget for cached response bodies. Once exceeded, further
+ * responses are marked skipped rather than cached.
+ */
+export const MAX_CACHED_TOTAL_BYTES = 50 * 1024 * 1024;
+
+const BODY_CAPTURE_TIMEOUT_MS = 5000;
+
 type WithSymbolId<T> = T & {
   [stableIdSymbol]?: number;
 };
@@ -516,7 +545,86 @@ const cdpRequestIdSymbol = Symbol('cdpRequestId');
 type RequestWithNetworkMetadata = HTTPRequest & {
   [cdpRequestIdSymbol]?: string;
   [networkRequestObservedAtSymbol]?: number;
+  [responseBodyCacheSymbol]?: Promise<CachedResponseBody>;
 };
+
+/**
+ * Per-page running total of cached response body bytes. Keyed weakly so it is
+ * released when the page is GC'd; also cleared explicitly on page destroy.
+ */
+const responseBodyBudget = new WeakMap<Page, {bytes: number}>();
+
+function pageForRequest(req: HTTPRequest): Page | undefined {
+  try {
+    // frame() can throw for service worker requests.
+    return req.frame()?.page();
+  } catch {
+    return undefined;
+  }
+}
+
+function withCaptureTimeout<T>(promise: Promise<T>): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error('Timed out capturing response body')),
+        BODY_CAPTURE_TIMEOUT_MS,
+      ),
+    ),
+  ]);
+}
+
+/**
+ * Eagerly fetch and cache a response body while the producing loader is still
+ * alive (called from `requestfinished`). After a navigation the browser evicts
+ * the body and a later `body()` call would fail; the cache lets inspect/export
+ * still return it. Fire-and-forget: the Promise is stored on the request so
+ * concurrent readers await the same capture.
+ */
+function captureResponseBody(req: HTTPRequest): void {
+  const request = req as RequestWithNetworkMetadata;
+  if (request[responseBodyCacheSymbol]) {
+    return;
+  }
+  request[responseBodyCacheSymbol] = (async (): Promise<CachedResponseBody> => {
+    try {
+      const resp = await req.response();
+      if (!resp) {
+        return {ok: false, error: 'No response available'};
+      }
+      const declared = Number(resp.headers()['content-length'] ?? 0);
+      if (declared > MAX_CACHED_BODY_BYTES) {
+        return {
+          ok: 'skipped',
+          reason: `content-length ${declared} exceeds cache limit`,
+        };
+      }
+      const buffer = await withCaptureTimeout(resp.body());
+      if (buffer.length > MAX_CACHED_BODY_BYTES) {
+        return {
+          ok: 'skipped',
+          reason: `body ${buffer.length} bytes exceeds cache limit`,
+        };
+      }
+      const page = pageForRequest(req);
+      if (page) {
+        const budget = responseBodyBudget.get(page) ?? {bytes: 0};
+        if (budget.bytes + buffer.length > MAX_CACHED_TOTAL_BYTES) {
+          return {ok: 'skipped', reason: 'page cache budget exhausted'};
+        }
+        budget.bytes += buffer.length;
+        responseBodyBudget.set(page, budget);
+      }
+      return {ok: true, buffer};
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  })();
+}
 
 export class NetworkCollector extends PageCollector<HTTPRequest> {
   #initiators = new WeakMap<Page, Map<string, RequestInitiator>>();
@@ -531,19 +639,28 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
       collector: (item: HTTPRequest) => void,
     ) => ListenerMap<PageEvents>,
   ) {
-    super(
-      context,
+    const baseListeners =
       listeners ??
-        (collect => {
-          return {
-            request: req => {
-              const request = req as RequestWithNetworkMetadata;
-              request[networkRequestObservedAtSymbol] = Date.now();
-              collect(req);
-            },
-          } as ListenerMap;
-        }),
-    );
+      (collect => {
+        return {
+          request: req => {
+            const request = req as RequestWithNetworkMetadata;
+            request[networkRequestObservedAtSymbol] = Date.now();
+            collect(req);
+          },
+        } as ListenerMap;
+      });
+    // Always capture the response body at requestfinished — before a navigation
+    // can evict it — regardless of which listeners variant is supplied.
+    super(context, collect => {
+      const map = baseListeners(collect);
+      const existingFinished = map.requestfinished;
+      map.requestfinished = req => {
+        captureResponseBody(req);
+        existingFinished?.(req);
+      };
+      return map;
+    });
     this.#sessionProvider = sessionProvider;
   }
 
@@ -645,6 +762,7 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
     }
     this.#cdpListeners.delete(page);
     this.#initiators.delete(page);
+    responseBodyBudget.delete(page);
   }
 
   /**
