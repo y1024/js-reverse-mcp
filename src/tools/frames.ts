@@ -32,7 +32,7 @@ function getFrameDepth(frame: Frame): number {
 export const selectFrame = defineTool({
   name: 'select_frame',
   description:
-    'Lists frames (including iframes), 20 per page by default. Pass frameIdx to switch evaluate_script context; use listPageIdx only to paginate the listing.',
+    'Lists or selects frames, including iframes, within the current page. Use it when the target element, page-defined global, script, or execution context may live in an iframe: first list frames, then pass frameIdx before click_element or evaluate_script. Omitting frameIdx lists 20 frames per page without changing context; passing frameIdx changes the shared frame target, with 0 restoring the main frame. It does not switch browser tabs or navigate—use select_page or navigate_page for those actions—and listPageIdx only paginates this listing.',
   annotations: {
     title: 'Select Frame',
     category: ToolCategory.DEBUGGING,
@@ -68,7 +68,7 @@ export const selectFrame = defineTool({
       .min(0)
       .optional()
       .describe(
-        'The frame index to select. 0 = main frame. If omitted, lists all frames without changing selection.',
+        'Frame index from the latest frame listing. Pass it to target later frame-aware tools; 0 restores the main frame. Omit it to list frames without changing context, and re-list after navigation or frame attachment/detachment because indices can shift.',
       ),
     pageSize: zod
       .number()
@@ -81,7 +81,9 @@ export const selectFrame = defineTool({
       .int()
       .min(0)
       .optional()
-      .describe('Page of the frame-list to return (0-based). Defaults to 0.'),
+      .describe(
+        'Zero-based pagination index for the frame listing only. This is not the frameIdx used to select a frame. Defaults to 0.',
+      ),
   },
   handler: async (request, response, context) => {
     const page = context.getSelectedPage();

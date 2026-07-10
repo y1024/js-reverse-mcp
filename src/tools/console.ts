@@ -43,8 +43,9 @@ const FILTERABLE_MESSAGE_TYPES: [
 export const listConsoleMessages = defineTool({
   name: 'list_console_messages',
   description:
-    'List console messages for the selected page, 20 per page by default. Pass msgid to get one message by stable ID.',
+    'Inspects console messages and uncaught page errors captured for the selected page. Use it to diagnose runtime failures, warnings, application logs, or values already emitted by page code; use search_in_sources for source text and list_network_requests for HTTP evidence instead. Without msgid it lists messages 20 per page by default, optionally filtered by type or retained navigation history. With msgid it returns one message by its stable ID for focused inspection. Capture begins when this MCP attaches and is not retroactive, so reload or reproduce code that logged before attachment.',
   annotations: {
+    title: 'List Console Messages',
     category: ToolCategory.DEBUGGING,
     readOnlyHint: true,
   },
@@ -58,7 +59,7 @@ export const listConsoleMessages = defineTool({
       .number()
       .optional()
       .describe(
-        'The msgid of a console message on the page from the listed console messages',
+        'Stable message ID returned by list mode. Pass it to inspect one captured console message; omit it to list messages.',
       ),
     pageSize: zod
       .number()
@@ -78,14 +79,14 @@ export const listConsoleMessages = defineTool({
       .array(zod.enum(FILTERABLE_MESSAGE_TYPES))
       .optional()
       .describe(
-        'Filter messages to only return messages of the specified console message types. When omitted or empty, returns all messages.',
+        'Console levels/types to include in list mode, such as error, warn, log, or trace. Values are OR-ed; omit or pass an empty array for all types.',
       ),
     includePreservedMessages: zod
       .boolean()
       .default(false)
       .optional()
       .describe(
-        'Set to true to return the preserved messages over the last 3 navigations.',
+        'Include retained console messages from the last 3 navigations. Leave false when only the current page load is relevant.',
       ),
   },
   handler: async (request, response) => {

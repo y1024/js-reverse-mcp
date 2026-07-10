@@ -117,7 +117,7 @@ async function appendStepSummary(
 export const listScripts = defineTool({
   name: 'list_scripts',
   description:
-    'Lists loaded JavaScript scripts, including inline and eval scripts. Returns 20 per page by default with script ID, URL/kind, and source map information. Script IDs are valid only for the current page load.',
+    'Discovers JavaScript currently loaded in the selected debugger context—the main frame by default, or the frame chosen with select_frame. Use select_frame first for iframe-specific source/debugger work. Includes external, inline, and eval scripts in that context; if you already know a function name, endpoint, or code literal, use search_in_sources instead. Each result includes a context-scoped scriptId that expires on reload, navigation, or debugger target change and, for external scripts, a URL that is the preferred selector for get_script_source or save_script_source.',
   annotations: {
     title: 'List Scripts',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -143,7 +143,7 @@ export const listScripts = defineTool({
       .string()
       .optional()
       .describe(
-        'Optional filter string to match against script URLs (case-insensitive partial match).',
+        'Case-insensitive URL substring used to narrow external scripts. It does not search source text or match unnamed inline/eval scripts; use search_in_sources for code-content queries.',
       ),
     ...paginationSchema,
   },
@@ -227,7 +227,7 @@ export const listScripts = defineTool({
 export const getScriptSource = defineTool({
   name: 'get_script_source',
   description:
-    'Gets a small snippet of a JavaScript script source by URL (recommended) or script ID. Supports line range (for normal files) or character offset (for minified single-line files). Prefer using url over scriptId — URLs remain stable across page navigations while script IDs become invalid after reload. This tool is designed for reading small code regions (e.g. around breakpoints or search results); specify startLine/endLine or offset/length for predictable inline output. If no range is provided, small sources are returned inline and large sources return a preview with guidance. To read an entire script file, especially a minified one, use save_script_source instead. WASM scripts cannot be shown inline; use save_script_source with a .wasm file path.',
+    'Reads a small source region around a search match, paused location, or known statement without executing or pausing the page. Select by URL when available because URL-backed scripts can be resolved again after navigation; use the debugger-context-scoped scriptId only for current inline/eval scripts. Use line ranges for normal source and offset/length for minified single-line bundles. For a whole, minified, or WASM source, use save_script_source; to observe runtime values next, call set_breakpoint_on_text against the original loaded source.',
   annotations: {
     title: 'Get Script Source',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -239,30 +239,34 @@ export const getScriptSource = defineTool({
       .string()
       .optional()
       .describe(
-        'Script URL (preferred). Stable across page navigations. Exact match first, then substring match.',
+        'URL from list_scripts, search_in_sources, or a call stack. Preferred stable selector for URL-backed scripts; resolution tries an exact match before a substring match, so provide enough of the URL to avoid ambiguity.',
       ),
     scriptId: zod
       .string()
       .optional()
       .describe(
-        'Script ID (from list_scripts). Becomes invalid after page navigation — prefer url instead.',
+        'Debugger-context-scoped script ID from list_scripts, search_in_sources, or paused information. Required for unnamed inline/eval scripts, but invalid after reload, navigation, or debugger target/frame change; prefer url for external scripts.',
       ),
     startLine: zod
       .number()
       .int()
       .optional()
-      .describe('Start line number (1-based). Use for multi-line files.'),
+      .describe(
+        'Inclusive 1-based start line, typically copied from search_in_sources or paused information. Use with endLine for normal multi-line source.',
+      ),
     endLine: zod
       .number()
       .int()
       .optional()
-      .describe('End line number (1-based). Use for multi-line files.'),
+      .describe(
+        'Inclusive 1-based end line for a bounded multi-line snippet. Omit both line bounds and use offset/length for a minified single-line bundle.',
+      ),
     offset: zod
       .number()
       .int()
       .optional()
       .describe(
-        'Character offset to start from (0-based). Use for minified single-line files.',
+        'Zero-based character offset into the original source. Use for a bounded read of minified single-line code when line ranges would be too large.',
       ),
     length: zod
       .number()
@@ -270,7 +274,7 @@ export const getScriptSource = defineTool({
       .optional()
       .default(1000)
       .describe(
-        'Number of characters to return when using offset (default: 1000).',
+        'Maximum characters to return from offset (default: 1000). This is ignored unless offset is provided.',
       ),
   },
   handler: async (request, response, context) => {
@@ -434,7 +438,7 @@ export const getScriptSource = defineTool({
 export const saveScriptSource = defineTool({
   name: 'save_script_source',
   description:
-    'Saves the full source code of a JavaScript script to a local file. PREFERRED over get_script_source whenever you need the whole file or want to search/read a minified script. This tool auto-formats (beautifies) minified .js/.mjs/.ts output via prettier so the saved file is human-readable. Use this for any non-trivial source inspection; only fall back to get_script_source for tiny known regions (e.g. ±20 lines around a breakpoint). Typical workflow: call save_script_source, then inspect the saved local file with your available file-reading or search tools. NOTE: because the saved file may be beautified, its line numbers may not match the original script. If you later need to set a breakpoint, use the original URL/scriptId with set_breakpoint_on_text rather than line numbers from the saved file.',
+    'Saves one complete JavaScript or WASM source for local inspection when an inline snippet is insufficient, especially for large or minified bundles. Prefer get_script_source for a small known region and search_in_sources to locate text across loaded scripts first. With format=true, destinations using a supported JavaScript/TypeScript extension are formatted by default; other extensions preserve raw source, and formatted line numbers may differ from the live page. Use distinctive text plus the original URL with set_breakpoint_on_text for runtime debugging. The returned filename is the resolved local path, while scriptId remains scoped to the current debugger context.',
   annotations: {
     title: 'Save Script Source',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -446,31 +450,31 @@ export const saveScriptSource = defineTool({
       .string()
       .optional()
       .describe(
-        'Script URL (preferred). Stable across page navigations. Exact match first, then substring match.',
+        'URL from list_scripts, search_in_sources, or a call stack. Preferred over scriptId because it can be resolved again after navigation; exact match is tried before substring match.',
       ),
     scriptId: zod
       .string()
       .optional()
       .describe(
-        'Script ID (from list_scripts). Becomes invalid after page navigation — prefer url instead.',
+        'Debugger-context-scoped script ID from list_scripts or search_in_sources. Use for unnamed inline/eval scripts; it becomes invalid after reload, navigation, or debugger target/frame change.',
       ),
     filePath: zod
       .string()
       .describe(
-        'Local file path to save the script source to. Absolute paths and paths relative to the current working directory are supported. Use a .js/.mjs/.cjs/.jsx/.ts/.tsx extension to enable auto-format (prettier beautify); other extensions save raw source verbatim. For WASM scripts, use a .wasm extension. Subject to --allowedRoots when configured.',
+        'Destination path for the complete source, absolute or relative to the server working directory and subject to --allowedRoots. A JavaScript/TypeScript extension enables formatting; use .wasm for bytecode or another extension to preserve raw text.',
       ),
     confirmOverwrite: zod
       .boolean()
       .default(false)
       .describe(
-        'Must be true when filePath already exists. New files do not require confirmation.',
+        'Set true only to authorize replacing an existing filePath. A new file does not require overwrite confirmation.',
       ),
     format: zod
       .boolean()
       .optional()
       .default(true)
       .describe(
-        'Auto-format JavaScript/TypeScript output with prettier (beautifies minified code). Defaults to true. Set to false to save the raw original source verbatim.',
+        'Format supported JavaScript/TypeScript extensions for readability (default: true). Set false when exact source bytes or original line layout matter; formatted line numbers cannot be used as live breakpoint locations.',
       ),
   },
   handler: async (request, response, context) => {
@@ -568,7 +572,7 @@ export const saveScriptSource = defineTool({
 export const searchInSources = defineTool({
   name: 'search_in_sources',
   description:
-    'Searches all loaded JavaScript sources, including inline/eval and compressed bundles by default. Returns matching lines with script ID, URL/kind, and line number. Use get_script_source for surrounding context.',
+    'Finds a known function name, endpoint, string literal, token, or code pattern in JavaScript loaded by the selected debugger context—the main frame by default, or the frame chosen with select_frame. It searches external, inline/eval, and minified sources in that context without executing or pausing the page, returning 1-based lines plus context-scoped scriptIds; URLs are the preferred selectors for URL-backed matches. Use select_frame first for iframe-specific source work, get_script_source for nearby context, save_script_source for a whole bundle, or set_breakpoint_on_text when runtime values are needed. For a known captured request, prefer get_request_initiator before a broad source search.',
   annotations: {
     title: 'Search in Sources',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -592,43 +596,53 @@ export const searchInSources = defineTool({
       .optional(),
   }),
   schema: {
-    query: zod.string().describe('The search query (string or regex pattern).'),
+    query: zod
+      .string()
+      .describe(
+        'Source text to locate, or a regular-expression pattern when isRegex=true. Prefer a distinctive function name, endpoint, property, or literal that can also anchor set_breakpoint_on_text.',
+      ),
     caseSensitive: zod
       .boolean()
       .optional()
       .default(false)
-      .describe('Whether the search should be case-sensitive.'),
+      .describe(
+        'Match case exactly when true. Leave false for discovery; set true when choosing exact code text for a breakpoint.',
+      ),
     isRegex: zod
       .boolean()
       .optional()
       .default(false)
-      .describe('Whether to treat the query as a regular expression.'),
+      .describe(
+        'Interpret query as a regular expression when true. Leave false for literal endpoint, token, and code-text searches.',
+      ),
     maxResults: zod
       .number()
       .int()
       .optional()
       .default(30)
-      .describe('Maximum number of results to return (default: 30).'),
+      .describe(
+        'Maximum matches to return (default: 30). Narrow with urlFilter before increasing this for common text.',
+      ),
     maxLineLength: zod
       .number()
       .int()
       .optional()
       .default(150)
       .describe(
-        'Maximum characters per matched line preview (default: 150). Increase if you need more context around the match.',
+        'Maximum characters in each matched-line preview (default: 150). Use get_script_source rather than a very large preview when surrounding context is needed.',
       ),
     excludeMinified: zod
       .boolean()
       .optional()
       .default(false)
       .describe(
-        'Skip minified files (files with very long lines). Default: false so compressed bundles are searched automatically.',
+        'Skip sources with very long lines when true. Keep the default false for reverse engineering because relevant code often exists only in compressed bundles.',
       ),
     urlFilter: zod
       .string()
       .optional()
       .describe(
-        'Only search scripts whose URL contains this string (case-insensitive).',
+        'Case-insensitive script-URL substring used to narrow matches to a known bundle or domain. It excludes unnamed inline/eval scripts.',
       ),
   },
   handler: async (request, response, context) => {
@@ -788,7 +802,7 @@ export const searchInSources = defineTool({
 export const removeBreakpoint = defineTool({
   name: 'remove_breakpoint',
   description:
-    'Removes breakpoints using an explicit action. Use remove_code with breakpointId, remove_xhr with url, or remove_all with confirm=true.',
+    'Removes a known code breakpoint, XHR/Fetch breakpoint, or every MCP-managed breakpoint after explicit confirmation. Use breakpointId from set_breakpoint_on_text/list_breakpoints for remove_code, or reuse the exact URL pattern from break_on_xhr/list_breakpoints for remove_xhr. Removal does not resume an already paused page; call pause_or_resume(action="resume") separately after inspection.',
   annotations: {
     title: 'Remove Breakpoint',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -800,21 +814,27 @@ export const removeBreakpoint = defineTool({
   schema: {
     action: zod
       .enum(['remove_code', 'remove_xhr', 'remove_all'])
-      .describe('Explicit breakpoint removal action.'),
+      .describe(
+        'Required removal mode: remove_code needs breakpointId, remove_xhr needs url, and remove_all removes both kinds.',
+      ),
     breakpointId: zod
       .string()
       .optional()
       .describe(
-        'The breakpoint ID to remove (from list_breakpoints or set_breakpoint_on_text).',
+        'Current breakpoint ID returned by set_breakpoint_on_text or list_breakpoints. Used only with action="remove_code"; list again after a debugger/page-session rebuild because restoration may assign a new ID.',
       ),
     url: zod
       .string()
       .optional()
-      .describe('The XHR breakpoint URL pattern to remove.'),
+      .describe(
+        'Exact URL substring pattern previously passed to break_on_xhr or returned by list_breakpoints. Used only with action="remove_xhr".',
+      ),
     confirm: zod
       .boolean()
       .default(false)
-      .describe('Must be true for any breakpoint removal action.'),
+      .describe(
+        'Must be true to authorize the selected removal action. This does not authorize or trigger resuming execution.',
+      ),
   },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
@@ -911,7 +931,7 @@ export const removeBreakpoint = defineTool({
 export const listBreakpoints = defineTool({
   name: 'list_breakpoints',
   description:
-    'Lists active code and XHR/Fetch breakpoints, 20 per page by default. Breakpoints are tracked by this MCP session and restored after navigation when possible.',
+    'Inspects code and XHR/Fetch breakpoints managed by this MCP session before reproducing an action or cleaning up debugger state. Returns current code breakpointIds and the exact XHR URL patterns needed by remove_breakpoint; URL-backed definitions are restored after navigation when possible, but a rebuilt debugger session may assign new IDs. This does not show why or where execution is currently paused—use get_paused_info for the active call stack.',
   annotations: {
     title: 'List Breakpoints',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1018,7 +1038,7 @@ export const listBreakpoints = defineTool({
 export const getRequestInitiator = defineTool({
   name: 'get_request_initiator',
   description:
-    'Gets the JavaScript call stack that initiated a network request. This helps trace which code triggered an API call.',
+    'Non-pausing first action for tracing which JavaScript initiated a retained HTTP request when CDP initiator evidence was active. Pass the reqid from list_network_requests; because initiator capture starts lazily and is not retroactive, an older request may have no stack—in that case reproduce the action and inspect the new reqid, or set break_on_xhr before reproduction when runtime values are required. If the captured stack identifies the code, inspect its URL/location with get_script_source. If arguments, locals, or a dynamically built payload are still needed, use break_on_xhr, reproduce, then call get_paused_info or evaluate_script before stepping or resuming. This tool only reads retained evidence and does not pause or reproduce the request.',
   annotations: {
     title: 'Get Request Initiator',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1030,7 +1050,7 @@ export const getRequestInitiator = defineTool({
       .number()
       .int()
       .describe(
-        'The request ID (from list_network_requests) to get the initiator for.',
+        'Numeric reqid returned by list_network_requests, not a raw CDP request ID. It survives navigation while retained, but becomes stale after FIFO eviction or clear_network_requests; list requests again if needed.',
       ),
   },
   handler: async (request, response, context) => {
@@ -1055,6 +1075,9 @@ export const getRequestInitiator = defineTool({
         );
         response.appendResponseLine(
           'This might be a navigation request or the initiator was not captured.',
+        );
+        response.appendResponseLine(
+          'Initiator capture is not retroactive. Reproduce the action now and inspect its new reqid; set break_on_xhr before reproduction if runtime values are required.',
         );
         response.setStructuredContent({requestId, initiator: null});
         return;
@@ -1123,7 +1146,7 @@ export const getRequestInitiator = defineTool({
 export const getPausedInfo = defineTool({
   name: 'get_paused_info',
   description:
-    'Gets information about the current paused state including call stack, current location, and scope variables. Use this after a breakpoint is hit to understand the execution context.',
+    'Inspects the current call stack, source locations, and selected call-frame scopes after a code/XHR breakpoint or explicit pause has stopped execution. It neither creates a pause nor resumes one. Returned frameIndex values and callFrameIds belong only to the current pause and expire after any step or resume; use evaluate_script with frameIndex for a focused expression, then step or pause_or_resume(action="resume").',
   annotations: {
     title: 'Get Paused Info',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1141,17 +1164,16 @@ export const getPausedInfo = defineTool({
       .boolean()
       .optional()
       .default(true)
-      .describe('Whether to include scope variables (default: true).'),
+      .describe(
+        'Include bounded variables from the selected call frame (default: true). Set false when only the stack and source locations are needed.',
+      ),
     maxScopeDepth: zod
       .number()
       .int()
       .optional()
       .default(2)
       .describe(
-        'Maximum scope depth to traverse (default: 2). ' +
-          '1 = local scope only (function args & local vars), ' +
-          '2 = local + closure scopes, ' +
-          '3+ = all non-global scopes.',
+        'Scope categories to include for frameIndex (default: 2): 1 reads arguments/locals, 2 also reads closures, and 3+ includes other non-global scopes. Increase only when the needed value is absent.',
       ),
     frameIndex: zod
       .number()
@@ -1159,8 +1181,7 @@ export const getPausedInfo = defineTool({
       .optional()
       .default(0)
       .describe(
-        'Which call frame to inspect scope variables for (0 = top frame). ' +
-          'Use the call stack indices to pick a frame.',
+        'Zero-based frame from this pause whose scopes should be read (default: top frame). Frame indices change after a step and expire on resume.',
       ),
   },
   handler: async (request, response, context) => {
@@ -1304,7 +1325,7 @@ export const getPausedInfo = defineTool({
 export const pauseOrResume = defineTool({
   name: 'pause_or_resume',
   description:
-    'Explicitly pauses or resumes JavaScript execution. Pass action="pause" or action="resume"; the tool never toggles implicitly.',
+    'Explicitly requests an immediate pause or resumes an existing paused execution; it never toggles implicitly. Use a code breakpoint or break_on_xhr instead when a specific statement/request should stop, and use get_paused_info before resuming if evidence must be collected. Resuming invalidates current callFrameIds and frame indices.',
   annotations: {
     title: 'Pause / Resume',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1314,7 +1335,9 @@ export const pauseOrResume = defineTool({
   schema: {
     action: zod
       .enum(['pause', 'resume'])
-      .describe('Explicit execution action: pause or resume.'),
+      .describe(
+        'Use "pause" only while running, or "resume" only after a breakpoint/manual pause. Resume after get_paused_info/evaluate_script/step inspection is complete.',
+      ),
   },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
@@ -1360,7 +1383,7 @@ export const pauseOrResume = defineTool({
 export const step = defineTool({
   name: 'step',
   description:
-    'Steps JavaScript execution. Use direction "over" to skip function calls, "into" to enter function bodies, "out" to exit the current function. Returns the new location with source context.',
+    'Advances JavaScript execution by one debugger operation from an existing pause and returns the next stopped call frame with concise source context. Use after get_paused_info or evaluate_script when control flow still needs tracing; it cannot start from running execution. Each advance invalidates prior callFrameIds, so inspect the new pause again as needed, then use pause_or_resume(action="resume") to finish.',
   annotations: {
     title: 'Step',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1371,7 +1394,7 @@ export const step = defineTool({
     direction: zod
       .enum(['over', 'into', 'out'])
       .describe(
-        'Step direction: "over" (next statement), "into" (enter function), "out" (exit function).',
+        'Choose "over" for the next statement without entering calls, "into" to follow a call, or "out" to continue until the current function returns.',
       ),
   },
   handler: async (request, response, context) => {
@@ -1423,7 +1446,7 @@ export const step = defineTool({
 export const setBreakpointOnText = defineTool({
   name: 'set_breakpoint_on_text',
   description:
-    'Sets a breakpoint on specific code (function name, statement, etc.) by searching loaded scripts and automatically determining a position. Optionally pass condition to reduce noisy hits after the code location is already precise; prefer text/urlFilter/occurrence for locating the breakpoint, and use condition only as a simple synchronous guard. Works with both normal and minified URL-backed scripts. Inline/eval scripts without a URL can be found but cannot receive this persistent URL breakpoint. Breakpoints persist across page navigations when the URL can be matched again.',
+    'Sets a restorable URL-backed breakpoint when distinctive code text is known and its runtime values must be observed. Call it directly when the user already supplies precise text plus any URL/occurrence disambiguation; use search_in_sources/get_script_source first only when the location is unknown or ambiguous. For an API with no known code location, start with list_network_requests and get_request_initiator or use break_on_xhr. On a hit, call get_paused_info, optionally evaluate_script, then step or resume. Returns the current breakpointId for remove_breakpoint; list breakpoints again after a rebuilt debugger session, and note that unnamed inline/eval scripts cannot use this URL breakpoint.',
   annotations: {
     title: 'Set Breakpoint on Text',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1434,13 +1457,13 @@ export const setBreakpointOnText = defineTool({
     text: zod
       .string()
       .describe(
-        'The code text to find and set breakpoint on (e.g., "function myFunc", "fetchData(", "apiCall").',
+        'Exact case-sensitive source text used to locate the breakpoint, such as a distinctive function declaration, call, or statement. Prefer a snippet confirmed by search_in_sources and avoid common tokens.',
       ),
     urlFilter: zod
       .string()
       .optional()
       .describe(
-        'Only search in scripts whose URL contains this string (case-insensitive).',
+        'Case-insensitive URL substring that limits candidate scripts. Use the URL from search_in_sources/get_script_source to avoid the same text in unrelated bundles.',
       ),
     occurrence: zod
       .number()
@@ -1448,12 +1471,14 @@ export const setBreakpointOnText = defineTool({
       .positive()
       .optional()
       .default(1)
-      .describe('Which occurrence to break on (1 = first, 2 = second, etc.).'),
+      .describe(
+        'One-based occurrence among matching loaded-source results (default: 1). Use only after reviewing multiple search matches; urlFilter is usually the more stable disambiguator.',
+      ),
     condition: zod
       .string()
       .optional()
       .describe(
-        'Optional synchronous JavaScript condition evaluated in the breakpoint call frame. Use only as a simple guard after choosing a precise code location; avoid complex logic, async work, or side effects. The breakpoint pauses only when this expression evaluates to true.',
+        'Optional simple synchronous expression evaluated in the future call frame; the breakpoint pauses only when it is true. Use it to reduce repeated hits after the location is precise, never for async work, complex discovery, or side effects.',
       ),
   },
   handler: async (request, response, context) => {
@@ -1581,7 +1606,7 @@ export const setBreakpointOnText = defineTool({
 export const breakOnXhr = defineTool({
   name: 'break_on_xhr',
   description:
-    'Sets a breakpoint that triggers when an XHR/Fetch request URL contains the specified string.',
+    'Sets a URL-substring breakpoint for a future XHR/Fetch when runtime request arguments, local variables, or payload construction must be inspected. For an already captured request, call get_request_initiator first because it is non-pausing; use this only when that evidence is insufficient. Set it before reproducing the user action—it does not inspect past traffic—then call get_paused_info/evaluate_script and finally step or resume. The URL pattern identifies this breakpoint for list_breakpoints and remove_breakpoint(action="remove_xhr").',
   annotations: {
     title: 'Break on XHR',
     category: ToolCategory.REVERSE_ENGINEERING,
@@ -1589,7 +1614,11 @@ export const breakOnXhr = defineTool({
   },
   capabilities: ['debugger'],
   schema: {
-    url: zod.string().describe('URL pattern to break on (partial match).'),
+    url: zod
+      .string()
+      .describe(
+        'Case-sensitive URL substring matched against future XHR/Fetch requests. Prefer a narrow endpoint path from list_network_requests; retain the exact string to remove the breakpoint later.',
+      ),
   },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;

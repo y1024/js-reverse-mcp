@@ -41,8 +41,9 @@ function formatCookieScope(cookie: {
 
 export const clearSiteData = defineTool({
   name: 'clear_site_data',
-  description: `Clear browser state after confirm=true to create a clean replay environment for the selected page. This clears cookies affecting its HTTP(S) frames, persistent storage for those origins, and frame sessionStorage. It does not reload. Browser HTTP cache is global and preserved by default; opt in with clearBrowserCache only when that wider effect is intended.`,
+  description: `Irreversibly clear browser state after confirm=true to create a clean replay environment for the selected page. Use this before replaying login, session creation, storage initialization, or other state-dependent flows; do not use it to inspect cookies or determine which response set one. For cookie provenance, including HttpOnly, Secure, and SameSite attributes, use list_network_requests with cookieName first. Cleanup covers cookies affecting the selected page's HTTP(S) frames—including HttpOnly and Secure cookies through the browser context—persistent storage for those frame origins, and each HTTP(S) frame's sessionStorage. It does not reload the page. The browser HTTP cache is global and is preserved by default; set clearBrowserCache=true only when that wider cross-page effect is explicitly intended.`,
   annotations: {
+    title: 'Clear Site Data',
     category: ToolCategory.BROWSER_STATE,
     readOnlyHint: false,
     destructiveHint: true,
@@ -53,14 +54,14 @@ export const clearSiteData = defineTool({
       .boolean()
       .default(false)
       .describe(
-        'Must be true to confirm deletion of cookies and origin storage for the selected page frames.',
+        "Must be true to irreversibly delete cookies affecting the selected page's HTTP(S) frames, persistent storage for those frame origins, and HTTP(S) frame sessionStorage. This confirms state reset for replay, not inspection.",
       ),
     clearBrowserCache: zod
       .boolean()
       .optional()
       .default(false)
       .describe(
-        'Also clear the browser-wide HTTP cache. This affects every page and origin in the browser, not only the selected site.',
+        'Also clear the browser-wide HTTP cache. Leave false for site-scoped replay cleanup. Setting true has a wider global effect on every page and origin in this browser, not only the selected page or its frame origins.',
       ),
   },
   handler: async (request, response, context) => {

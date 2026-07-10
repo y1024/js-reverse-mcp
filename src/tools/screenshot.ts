@@ -11,8 +11,9 @@ import {defineTool} from './ToolDefinition.js';
 
 export const screenshot = defineTool({
   name: 'take_screenshot',
-  description: `Take a screenshot of the currently selected page. By default captures the visible viewport; set fullPage=true to capture the full page.`,
+  description: `Captures the visual state of the currently selected page. Use it to verify page layout, visible UI state, selector targets, in-page dialogs/modals, or the effect of a navigation/click; it is not a substitute for DOM values, network evidence, or script inspection. By default it returns the visible viewport, while fullPage=true captures the whole document; oversized captures may be saved as a temporary artifact instead of attached. Pass filePath for a reusable local artifact; existing files require confirmOverwrite=true and remain subject to --allowedRoots.`,
   annotations: {
+    title: 'Take Screenshot',
     category: ToolCategory.DEBUGGING,
     // Not read-only due to filePath param.
     readOnlyHint: false,
@@ -21,7 +22,9 @@ export const screenshot = defineTool({
     format: zod
       .enum(['png', 'jpeg'])
       .default('png')
-      .describe('Type of format to save the screenshot as. Default is "png"'),
+      .describe(
+        'Image format for the attachment or saved file. Defaults to png; use jpeg when smaller lossy output is preferred.',
+      ),
     quality: zod
       .number()
       .min(0)
@@ -34,13 +37,13 @@ export const screenshot = defineTool({
       .boolean()
       .optional()
       .describe(
-        'If set to true, captures the full page instead of the currently visible viewport.',
+        'Capture the entire scrollable document when true; leave false or omit it for the currently visible viewport.',
       ),
     filePath: zod
       .string()
       .optional()
       .describe(
-        'The absolute path, or a path relative to the current working directory, to save the screenshot to instead of attaching it to the response. Subject to --allowedRoots when configured.',
+        'Optional absolute or working-directory-relative path for a reusable screenshot artifact. Omit it to attach the image directly. Subject to --allowedRoots when configured.',
       ),
     confirmOverwrite: zod
       .boolean()

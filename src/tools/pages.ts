@@ -95,8 +95,9 @@ async function rebuildScriptsAfterNavigationFailure(
 
 export const selectPage = defineTool({
   name: 'select_page',
-  description: `Lists open pages, 20 per page by default. Pass pageIdx to select a page; use listPageIdx only to paginate the listing.`,
+  description: `Lists or selects open browser pages. Use it without pageIdx to identify the active page or choose the correct tab before inspecting network traffic, scripts, frames, or console output; pass pageIdx to make one listed page the shared target for later tools. It does not navigate or create pages: use navigate_page to change the selected page's URL and new_page when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.`,
   annotations: {
+    title: 'Select Page',
     category: ToolCategory.NAVIGATION,
     readOnlyHint: false,
   },
@@ -117,7 +118,7 @@ export const selectPage = defineTool({
       .number()
       .optional()
       .describe(
-        'The index of the page to select. If omitted, lists all pages without changing selection.',
+        'Snapshot index from the latest page listing. Pass it to make that page the target for later tools; omit it to list pages without changing selection. Re-list after pages open or close because indices can shift.',
       ),
     pageSize: zod
       .number()
@@ -130,7 +131,9 @@ export const selectPage = defineTool({
       .int()
       .min(0)
       .optional()
-      .describe('Page of the page-list to return (0-based). Defaults to 0.'),
+      .describe(
+        'Zero-based pagination index for the page listing only. This is not the pageIdx used to select a browser page. Defaults to 0.',
+      ),
   },
   handler: async (request, response, context) => {
     if (request.params.pageIdx === undefined) {
@@ -161,13 +164,18 @@ const DEFAULT_REFERER = 'https://www.google.com/';
 
 export const newPage = defineTool({
   name: 'new_page',
-  description: `Opens a browser page and navigates to the specified URL. If an existing about:blank startup tab is still available, it is reused instead of opening an extra tab. Waits for DOMContentLoaded event (not full page load). Default timeout is 10 seconds.`,
+  description: `Opens a separate browser page for a URL, reusing an existing about:blank startup tab when available. Use this when the task needs another tab or should preserve the currently selected page; use navigate_page to change the URL in the existing selected page instead. It waits for DOMContentLoaded, not every background resource, and then makes the opened page the target for later tools. It preserves cookies, storage, cache, and other browser state; use clear_site_data separately when a clean replay is required.`,
   annotations: {
+    title: 'New Page',
     category: ToolCategory.NAVIGATION,
     readOnlyHint: false,
   },
   schema: {
-    url: zod.string().describe('URL to load in the opened browser page.'),
+    url: zod
+      .string()
+      .describe(
+        'Absolute URL to load in a separate or reusable blank page. Use navigate_page instead when the current selected page should be reused.',
+      ),
     ...timeoutSchema,
   },
   handler: async (request, response, context) => {
@@ -200,8 +208,9 @@ export const newPage = defineTool({
 
 export const navigatePage = defineTool({
   name: 'navigate_page',
-  description: `Navigates the currently selected page to a URL, or performs back/forward/reload navigation. This tool only navigates; it does not clear cookies, storage, cache, or site data. Waits for DOMContentLoaded event (not full page load). Default timeout is 10 seconds. After navigation, stale script IDs are cleared and fresh ones are captured automatically when the debugger is enabled. Tracked code URL breakpoints and XHR/Fetch breakpoints are restored across navigation when possible.`,
+  description: `Navigates, reloads, or moves through history in the currently selected page. Use it to reproduce requests, trigger configured breakpoints, refresh scripts, or continue a workflow in the same tab; use new_page when a separate tab is required. It does not clear cookies, storage, cache, or site data, so call clear_site_data first only when a clean replay is intended. It waits for DOMContentLoaded rather than every background resource; if a breakpoint pauses loading, use get_paused_info and then pause_or_resume(action="resume"). Navigation invalidates old script IDs, while tracked URL and XHR/Fetch breakpoints are restored when possible.`,
   annotations: {
+    title: 'Navigate Page',
     category: ToolCategory.NAVIGATION,
     readOnlyHint: false,
   },
@@ -210,9 +219,14 @@ export const navigatePage = defineTool({
       .enum(['url', 'back', 'forward', 'reload'])
       .optional()
       .describe(
-        'Navigate the page by URL, back or forward in history, or reload.',
+        'Navigation action for the selected page: url, back, forward, or reload. Use type=url together with url; omit type only when url is provided.',
       ),
-    url: zod.string().optional().describe('Target URL (only type=url)'),
+    url: zod
+      .string()
+      .optional()
+      .describe(
+        'Target URL for type=url. Do not pass it for back, forward, or reload.',
+      ),
     ...timeoutSchema,
   },
   handler: async (request, response, context) => {

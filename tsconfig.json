@@ -26,6 +26,7 @@
   "include": [
     "src/**/*.ts",
     "tests/**/*.ts",
+    "scripts/evaluate-tool-routing.ts",
     "scripts/generate-docs.ts",
     "scripts/run-tests.ts"
   ],

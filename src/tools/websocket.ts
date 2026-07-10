@@ -26,8 +26,9 @@ const DIRECTION_OPTIONS: readonly ['sent', 'received'] = ['sent', 'received'];
 
 export const getWebSocketMessages = defineTool({
   name: 'get_websocket_messages',
-  description: `Lists WebSocket connections or gets messages for a specific connection. Without wsid, lists all connections. With wsid, gets messages. Set analyze=true to group messages by pattern. Use groupId to filter by group. Use frameIndex to get a single message's detail by the stable frame index shown in message tables and analysis samples.`,
+  description: `Inspect captured bidirectional WebSocket connections and frame payloads for the selected page. Use this for WebSocket, socket, live-update, push, streaming, or realtime message flows; use list_network_requests for ordinary HTTP/XHR/fetch traffic and WebSocket upgrade request headers. WebSocket capture starts lazily on this tool's first use and is not retroactive: if the relevant socket already connected or exchanged frames, call this tool once to initialize capture, then reload or reproduce the flow. Without wsid it lists connections so you can choose one. With wsid it lists paginated sent/received frames; add show_content=true for payload previews. With wsid and analyze=true it groups frames by payload pattern and returns group IDs and sample frame indices; then use groupId to inspect one pattern. With wsid and frameIndex it returns one retained frame's detailed payload using the stable index shown in frame tables or analysis samples.`,
   annotations: {
+    title: 'Inspect WebSocket Messages',
     category: ToolCategory.NETWORK,
     readOnlyHint: true,
   },
@@ -52,14 +53,14 @@ export const getWebSocketMessages = defineTool({
       .number()
       .optional()
       .describe(
-        'The wsid of the WebSocket connection. If omitted, lists all connections.',
+        'Select a WebSocket connection by the wsid returned from connection-list mode. Omit it to list captured connections before inspecting their frames.',
       ),
     analyze: zod
       .boolean()
       .optional()
       .default(false)
       .describe(
-        'Set to true to analyze and group messages by pattern/fingerprint. Returns statistics and sample indices for each message type.',
+        'With wsid, group retained frames by payload pattern/fingerprint. Use this to discover message types in noisy realtime traffic; it returns traffic statistics, group IDs, and sample stable frame indices. Follow with groupId or frameIndex for focused inspection.',
       ),
     frameIndex: zod
       .number()
@@ -67,17 +68,19 @@ export const getWebSocketMessages = defineTool({
       .min(0)
       .optional()
       .describe(
-        'Get a single retained message by its stable frame index. Indices are monotonic and may start above 0 after old frames are evicted; use the Idx values shown by message tables or analyze=true.',
+        'With wsid, return one retained frame and its payload by stable frame index. This is the Idx shown in frame tables or analyze=true samples, not a page-relative array offset. Indices are monotonic and may begin above 0 after older frames are evicted.',
       ),
     direction: zod
       .enum(DIRECTION_OPTIONS)
       .optional()
-      .describe('Filter by direction: "sent" or "received".'),
+      .describe(
+        'With wsid, restrict frame-list, analysis, or group results to frames "sent" by the page or "received" from the server. It does not filter connection-list mode.',
+      ),
     groupId: zod
       .string()
       .optional()
       .describe(
-        'Filter by group ID (A, B, C, ...). Run with analyze=true first to get group IDs; if analyze used a direction filter, pass the same direction here.',
+        'With wsid, list only frames from a pattern group such as A, B, or C. Run analyze=true first to discover group IDs. If analysis used direction, repeat the same direction because grouping is computed over that filtered frame set.',
       ),
     pageSize: zod
       .number()
@@ -86,33 +89,35 @@ export const getWebSocketMessages = defineTool({
       .default(10)
       .optional()
       .describe(
-        'Messages per page (for messages mode) or connections per page (for list mode). Defaults to 10.',
+        'Items per page: connections when wsid is omitted, frames in normal/group mode, or pattern groups when analyze=true. Defaults to 10.',
       ),
     pageIdx: zod
       .number()
       .int()
       .min(0)
       .optional()
-      .describe('Page number (0-based).'),
+      .describe(
+        'Zero-based page for the active connection-list, frame-list, group-list, or analysis-group mode. Omit it for the first page.',
+      ),
     show_content: zod
       .boolean()
       .default(false)
       .optional()
       .describe(
-        'Set to true to append payload previews (up to 10,000 characters each) for the current page of messages. Default false (summary only).',
+        'With wsid in normal or group frame-list mode, include payload previews up to 10,000 characters for frames on the current page. Leave false for compact metadata, or use frameIndex when one exact frame needs detailed inspection.',
       ),
     urlFilter: zod
       .string()
       .optional()
       .describe(
-        'Filter connections by URL (only for listing connections without wsid).',
+        'In connection-list mode only (without wsid), return WebSocket URLs containing this substring. Use it to narrow by host, path, or query text.',
       ),
     includePreservedConnections: zod
       .boolean()
       .default(false)
       .optional()
       .describe(
-        'Set to true to return the preserved connections over the last 3 navigations (only for listing connections without wsid).',
+        'In connection-list mode only (without wsid), include connections preserved from the last three navigations. Use this when the relevant socket belonged to a previous page state.',
       ),
   },
   handler: async (request, response, context) => {

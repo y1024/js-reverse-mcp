@@ -156,9 +156,10 @@ async function runCancellableEvaluation<T>(
 
 export const evaluateScript = defineTool({
   name: 'evaluate_script',
-  description: `Evaluate a JavaScript function inside the currently selected page. Returns the response as JSON
-so returned values have to JSON-serializable. Inline JSON results are bounded; use outputFile for exact large results. When execution is paused at a breakpoint, automatically evaluates in the paused call frame context. Use localFilePath when the function needs one local data file, commonly a network body or JSON exported by another tool. The MCP server reads the file and passes it as localFile; browser JavaScript does not read local paths. Local-file access can expose host data and is restricted by --allowedRoots when configured.`,
+  description:
+    "Evaluates one focused JavaScript function for DOM/page state, web storage, page-defined globals, a paused-frame expression, or browser-side processing of one local file. Use it when those runtime values are the goal and no narrower evidence tool applies. Do not use document.cookie or page evaluation to investigate HttpOnly/Secure cookies, Set-Cookie provenance, or captured HTTP evidence; use list_network_requests with cookieName/reqid, and use search_in_sources/get_script_source for source discovery. While running, evaluation uses the selected frame's isolated world by default or its page main world with mainWorld=true; while paused, it always uses the chosen call frame and ignores mainWorld. Call get_paused_info before paused evaluation, then step or resume when finished. Arbitrary code can change page/external state and requires confirm=true; inline results are bounded, so use outputFile for exact large or binary results.",
   annotations: {
+    title: 'Evaluate Script',
     category: ToolCategory.DEBUGGING,
     readOnlyHint: false,
     destructiveHint: true,
@@ -179,52 +180,44 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
       .boolean()
       .default(false)
       .describe(
-        'Must be true because arbitrary page JavaScript can modify browser state, send network requests, or trigger external side effects.',
+        'Must be true to authorize this exact arbitrary-code evaluation, which may mutate page state, send requests, or cause external side effects. Prefer a read-only expression when inspection is sufficient.',
       ),
-    function: zod.string().describe(
-      `A JavaScript function declaration to be executed by the tool in the currently selected page.
-Example without arguments: \`() => {
-  return document.title
-}\` or \`async () => {
-  return await fetch("example.com")
-}\`.
-If localFilePath is provided, the function receives one argument: \`async ({ localFile }) => { ... }\`. Use localFile.text when present for UTF-8 text/JSON and localFile.base64 for exact bytes. To keep data for later calls, assign it explicitly in JavaScript, for example \`window.__mcpPayload = JSON.parse(localFile.text)\` with mainWorld=true.
-`,
-    ),
+    function: zod
+      .string()
+      .describe(
+        'JavaScript function declaration invoked by the tool, for example `() => document.title` or `async () => await Promise.resolve(location.href)`. Return JSON-serializable data; ArrayBuffer/typed arrays require outputFile for exact bytes. With localFilePath, accept `async ({localFile}) => ...` and read localFile.text for UTF-8 or localFile.base64 for exact bytes. Keep the function focused; use mainWorld=true only when page-defined globals are required.',
+      ),
     mainWorld: zod
       .boolean()
       .optional()
       .default(false)
       .describe(
-        'Execute the function in the page main world instead of the default isolated context. ' +
-          'Use this when you need to access page-defined globals (e.g. window.bdms, window.app). ' +
-          'Async functions are supported, and returned values must be JSON-serializable unless outputFile is used for binary data.',
+        "Running-page mode only: false uses the selected frame's isolated context; true uses that frame's page main world to access application-defined globals. When execution is paused, evaluation always targets frameIndex and this option is ignored.",
       ),
     frameIndex: zod
       .number()
       .int()
       .optional()
       .describe(
-        'When paused at a breakpoint, which call frame to evaluate in (0 = top frame). ' +
-          'If omitted, uses the top frame. Use get_paused_info to see available frames.',
+        'Paused mode only: zero-based call frame from get_paused_info (default: top frame). The index and its callFrameId expire after any step or resume.',
       ),
     outputFile: zod
       .string()
       .optional()
       .describe(
-        'If provided, saves the evaluation result to this local file path instead of returning it in the chat. JSON-serializable results are saved as JSON text; ArrayBuffer and Uint8Array results are saved as raw bytes. Useful for dumping large data or binary memory regions. The response reports the resolved absolute path. Subject to --allowedRoots when configured.',
+        'Save the exact result locally instead of returning bounded inline content. JSON-serializable values are written as JSON text and ArrayBuffer/typed arrays as raw bytes; the returned filename is resolved and subject to --allowedRoots.',
       ),
     confirmOverwrite: zod
       .boolean()
       .default(false)
       .describe(
-        'Must be true when outputFile already exists. New files do not require confirmation.',
+        'Set true only to authorize replacing an existing outputFile. A new file does not require overwrite confirmation.',
       ),
     localFilePath: zod
       .string()
       .optional()
       .describe(
-        'Absolute path to one local file to pass to the evaluated function as localFile. Relative paths, file:// URLs, globs, ~, and directories are rejected. If provided, write the function as async ({ localFile }) => { ... }. Use localFile.text when present for UTF-8 text/JSON and localFile.base64 for exact bytes. Subject to --allowedRoots when configured.',
+        'Absolute path to one host file passed as localFile; the browser never reads the path directly. Relative paths, file:// URLs, globs, ~, and directories are rejected, access is subject to --allowedRoots, and file contents may expose sensitive host data.',
       ),
   },
   handler: async (request, response, context) => {

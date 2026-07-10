@@ -23,7 +23,7 @@ const MODIFIERS = ['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift'] as const;
 export const clickElement = defineTool({
   name: 'click_element',
   description:
-    'Clicks one visible element after confirm=true using a CSS selector. The selector must resolve to exactly one element unless index is explicit. Returns resolved element metadata so the action is auditable.',
+    'Performs one verified, auditable click in the currently selected frame. Use it when the task requires activating a known button, link, or control after selecting the correct page/frame and identifying a CSS selector; it is the preferred minimal interaction primitive over arbitrary evaluate_script code. It does not discover elements, type text, or silently guess among matches: the selector must resolve to exactly one element unless index is explicit, and the chosen element must be visible. A click can submit data, navigate, or trigger external effects, so confirm=true is required and the result reports the exact resolved element.',
   annotations: {
     title: 'Click Element',
     category: ToolCategory.NAVIGATION,
@@ -51,13 +51,15 @@ export const clickElement = defineTool({
       .boolean()
       .default(false)
       .describe(
-        'Must be true because a click can cause external side effects.',
+        'Must be true to authorize this specific click because it can submit data, navigate, or trigger external side effects.',
       ),
     selector: zod
       .string()
       .trim()
       .min(1)
-      .describe('CSS selector evaluated in the currently selected frame.'),
+      .describe(
+        'CSS selector evaluated only in the currently selected frame. Use select_frame first when the target is inside an iframe.',
+      ),
     index: zod
       .number()
       .int()

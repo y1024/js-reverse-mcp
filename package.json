@@ -31,6 +31,8 @@
     "docs": "npm run build && npm run docs:generate && prettier --write --cache docs/",
     "docs:generate": "node build/scripts/generate-docs.js",
     "docs:check": "npm run build && node build/scripts/generate-docs.js --check",
+    "eval:routing": "npm run build && node build/scripts/evaluate-tool-routing.js --live",
+    "eval:routing:validate": "npm run build && node build/scripts/evaluate-tool-routing.js --validate-only",
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "start": "npm run build && node build/src/index.js",
     "start-debug": "DEBUG=mcp:* DEBUG_COLORS=false npm run build && node build/src/index.js",
@@ -39,7 +41,7 @@
     "test:only": "npm run build && npm run test:run -- --test-only",
     "test:only:no-build": "npm run test:run -- --test-only",
     "test:update-snapshots": "npm run build && npm run test:run -- --test-update-snapshots",
-    "presubmit": "npm run typecheck && npm run check-format && npm test && npm run docs:check && npm run audit:prod && npm pack --dry-run",
+    "presubmit": "npm run typecheck && npm run check-format && npm test && npm run eval:routing:validate && npm run docs:check && npm run audit:prod && npm pack --dry-run",
     "prepublishOnly": "npm run presubmit"
   },
   "files": [

@@ -366,6 +366,21 @@ If a site blocks you (e.g. Zhihu returning error 40362, Cloudflare challenge loo
 
 See [docs/cloak.en.md](docs/cloak.en.md) for when `--cloak` is the right call (and when it isn't).
 
+## Agent routing evaluation (maintainers)
+
+`npm run eval:routing:validate` checks the actual MCP `tools/list`, server instructions, and the 30 tool-selection contracts in `evals/tool-routing.json` entirely offline. It is part of presubmit and never calls a model endpoint.
+
+The real-model evaluation is explicitly opt-in. It makes one request per case to an OpenAI-compatible Chat Completions endpoint and may incur cost:
+
+```bash
+MCP_ROUTING_EVAL_ENDPOINT=https://api.example.com/v1/chat/completions \
+MCP_ROUTING_EVAL_MODEL=model-name \
+MCP_ROUTING_EVAL_API_KEY=secret \
+npm run eval:routing
+```
+
+Omit `MCP_ROUTING_EVAL_API_KEY` for an unauthenticated local endpoint. Credentialed remote endpoints must use HTTPS; HTTP is accepted only for loopback. `MCP_ROUTING_EVAL_TIMEOUT_MS` optionally sets the per-request timeout. The default pass threshold is 100%; set `MCP_ROUTING_EVAL_MIN_PASS_RATE` to a value in `(0, 1]` for cross-model comparisons. The evaluator never prints the API key, endpoint, or endpoint error response body.
+
 ## Security Notice
 
 This tool exposes browser content to MCP clients, allowing inspection, debugging, and modification of any data in the browser. Do not use it on pages containing sensitive information.

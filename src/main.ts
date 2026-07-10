@@ -66,6 +66,12 @@ const VERSION = (
   ) as {version: string}
 ).version;
 
+const SERVER_INSTRUCTIONS = `Use purpose-built tools for network, source, debugger, and browser-state evidence. Use evaluate_script directly for requested DOM/page state, web storage, page-defined globals, paused-frame expressions, or browser-side local-file processing when no narrower tool applies. Reuse returned IDs only within each tool's documented lifetime; prefer a script URL because scriptId expires on reload, navigation, or debugger frame/target change.
+
+For captured HTTP/API traffic, redirects, HTTP authentication flows, or cookie provenance, start with list_network_requests. To find where an exact cookie was created, refreshed, rotated, overwritten, or deleted—including HttpOnly, Secure, and SameSite cookies—call list_network_requests with cookieName. Then inspect the returned reqid or export outputPart="responseHeaders" for complete Set-Cookie values and attributes. Use get_request_initiator on a captured reqid to locate client-side JavaScript that initiated that request, if any. Initiator CDP data is not retroactive: if an older reqid has no initiator, reproduce the action after network capability is active and inspect the new reqid, or set break_on_xhr before reproduction. If runtime arguments or local variables are still needed, set break_on_xhr with a narrow URL substring, reproduce the request, inspect get_paused_info, optionally evaluate in the paused frame, and explicitly resume execution.
+
+For code discovery, use search_in_sources when you know text and list_scripts when you do not; read a bounded region with get_script_source or save a complete/minified source with save_script_source. Use get_websocket_messages for WebSocket frames rather than the HTTP upgrade request. WebSocket frame capture is not retroactive: call get_websocket_messages once before reloading or reproducing an already-finished socket flow because earlier frames cannot be recovered. Select the correct page before page-scoped work. Select a frame for iframe-specific source, debugger, evaluate, or click work; network and cookie evidence is page-scoped and does not require frame selection. Prefer click_element for one known interaction. For code evaluation, clicks, deletion of state/evidence, or breakpoint removal, set confirm=true only when the user explicitly authorizes that specific effect; otherwise request confirmation.`;
+
 export const args = parseArguments(VERSION);
 configureAllowedRoots(args.allowedRoots);
 warnAboutUnsafeDebugLogging();
@@ -77,10 +83,13 @@ const server = new McpServer(
   {
     name: 'js-reverse',
     title: 'JS Reverse Engineering MCP Server',
-    description: `JavaScript reverse engineering and debugging via Chrome DevTools (v${VERSION}). Built on Patchright anti-detection engine — passes mainstream browser fingerprint checks (Zhihu, Google, etc.) out of the box.`,
+    description: `Agent-oriented JavaScript reverse engineering through Chrome DevTools (v${VERSION}): inspect HTTP and WebSocket evidence, trace Set-Cookie provenance and request initiators, search scripts, debug breakpoints, and perform controlled page interactions. Patchright provides the supporting anti-detection browser layer.`,
     version: VERSION,
   },
-  {capabilities: {logging: {}}},
+  {
+    capabilities: {logging: {}},
+    instructions: SERVER_INSTRUCTIONS,
+  },
 );
 server.server.setRequestHandler(SetLevelRequestSchema, () => {
   return {};
