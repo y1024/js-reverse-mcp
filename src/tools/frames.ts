@@ -6,9 +6,15 @@
 
 import type {Frame} from '../third_party/index.js';
 import {zod} from '../third_party/index.js';
+import {ToolError} from '../ToolError.js';
+import {paginate} from '../utils/pagination.js';
 
 import {ToolCategory} from './categories.js';
-import {defineTool} from './ToolDefinition.js';
+import {
+  createToolOutputSchema,
+  defineTool,
+  PAGINATION_OUTPUT_SCHEMA,
+} from './ToolDefinition.js';
 
 function getFrameDepth(frame: Frame): number {
   let depth = 0;
@@ -26,12 +32,35 @@ function getFrameDepth(frame: Frame): number {
 export const selectFrame = defineTool({
   name: 'select_frame',
   description:
-    'Lists all frames (including iframes) in the current page. Pass frameIdx to switch the execution context used by evaluate_script. Other tools may still operate at page level.',
+    'Lists frames (including iframes), 20 per page by default. Pass frameIdx to switch evaluate_script context; use listPageIdx only to paginate the listing.',
   annotations: {
     title: 'Select Frame',
     category: ToolCategory.DEBUGGING,
     readOnlyHint: false,
   },
+  capabilities: ['debugger'],
+  outputSchema: createToolOutputSchema({
+    frames: zod
+      .array(
+        zod.object({
+          frameIdx: zod.number().int(),
+          url: zod.string(),
+          name: zod.string(),
+          selected: zod.boolean(),
+          depth: zod.number().int(),
+        }),
+      )
+      .optional(),
+    selectedFrame: zod
+      .object({
+        frameIdx: zod.number().int(),
+        url: zod.string(),
+        name: zod.string(),
+        isMainFrame: zod.boolean(),
+      })
+      .optional(),
+    pagination: PAGINATION_OUTPUT_SCHEMA.optional(),
+  }),
   schema: {
     frameIdx: zod
       .number()
@@ -41,6 +70,18 @@ export const selectFrame = defineTool({
       .describe(
         'The frame index to select. 0 = main frame. If omitted, lists all frames without changing selection.',
       ),
+    pageSize: zod
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe('Maximum frames to list per response. Defaults to 20.'),
+    listPageIdx: zod
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe('Page of the frame-list to return (0-based). Defaults to 0.'),
   },
   handler: async (request, response, context) => {
     const page = context.getSelectedPage();
@@ -54,10 +95,23 @@ export const selectFrame = defineTool({
         return;
       }
 
-      response.appendResponseLine(`Frames (${frames.length} total):\n`);
+      const paginated = paginate(frames, {
+        pageSize: request.params.pageSize,
+        pageIdx: request.params.listPageIdx,
+      });
+      if (paginated.invalidPage) {
+        throw new ToolError(
+          'INVALID_ARGUMENT',
+          `listPageIdx ${request.params.listPageIdx} is outside 0-${paginated.totalPages - 1}.`,
+        );
+      }
+      response.appendResponseLine(
+        `Frames (${frames.length} total), showing ${paginated.startIndex + 1}-${paginated.endIndex}:\n`,
+      );
 
-      for (let i = 0; i < frames.length; i++) {
-        const frame = frames[i];
+      for (let offset = 0; offset < paginated.items.length; offset++) {
+        const frame = paginated.items[offset];
+        const i = paginated.startIndex + offset;
         const isSelected = frame === currentFrame;
         const indent = getFrameDepth(frame);
         const prefix = '  '.repeat(indent);
@@ -67,6 +121,27 @@ export const selectFrame = defineTool({
           `${prefix}${i}: ${frame.url() || '(empty)'}${name}${marker}`,
         );
       }
+      if (paginated.hasNextPage) {
+        response.appendResponseLine(
+          `Next page: listPageIdx=${paginated.currentPage + 1}`,
+        );
+      }
+      response.setStructuredContent({
+        frames: paginated.items.map((frame, offset) => ({
+          frameIdx: paginated.startIndex + offset,
+          url: frame.url(),
+          name: frame.name(),
+          selected: frame === currentFrame,
+          depth: getFrameDepth(frame),
+        })),
+        pagination: {
+          pageIdx: paginated.currentPage,
+          pageSize: request.params.pageSize ?? 20,
+          totalItems: frames.length,
+          totalPages: paginated.totalPages,
+          hasNextPage: paginated.hasNextPage,
+        },
+      });
       return;
     }
 
@@ -74,23 +149,31 @@ export const selectFrame = defineTool({
     const {frameIdx} = request.params;
 
     if (frameIdx >= frames.length) {
-      response.appendResponseLine(
+      throw new ToolError(
+        'INVALID_ARGUMENT',
         `Invalid frame index ${frameIdx}. Available: 0-${frames.length - 1}.`,
       );
-      return;
     }
 
     const frame = frames[frameIdx];
 
     if (frameIdx === 0) {
-      context.resetSelectedFrame();
+      await context.resetSelectedFrame();
       response.appendResponseLine('Switched to main frame.');
     } else {
-      context.selectFrame(frame);
+      await context.selectFrame(frame);
       const name = frame.name() ? ` (name: "${frame.name()}")` : '';
       response.appendResponseLine(
         `Switched to frame ${frameIdx}: ${frame.url()}${name}`,
       );
     }
+    response.setStructuredContent({
+      selectedFrame: {
+        frameIdx,
+        url: frame.url(),
+        name: frame.name(),
+        isMainFrame: frameIdx === 0,
+      },
+    });
   },
 });

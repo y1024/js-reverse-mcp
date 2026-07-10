@@ -25,23 +25,10 @@ export function paginate<Item>(
 ): PaginationResult<Item> {
   const total = items.length;
 
-  if (!options || noPaginationOptions(options)) {
-    return {
-      items,
-      currentPage: 0,
-      totalPages: 1,
-      hasNextPage: false,
-      hasPreviousPage: false,
-      startIndex: 0,
-      endIndex: total,
-      invalidPage: false,
-    };
-  }
-
-  const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+  const pageSize = options?.pageSize ?? DEFAULT_PAGE_SIZE;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const {currentPage, invalidPage} = resolvePageIndex(
-    options.pageIdx,
+    options?.pageIdx,
     totalPages,
   );
 
@@ -59,10 +46,6 @@ export function paginate<Item>(
     endIndex,
     invalidPage,
   };
-}
-
-function noPaginationOptions(options: PaginationOptions): boolean {
-  return options.pageSize === undefined && options.pageIdx === undefined;
 }
 
 function resolvePageIndex(

@@ -16,9 +16,18 @@ import {
 } from './browser.js';
 import type {BrowserResult} from './browser.js';
 import {parseArguments} from './cli.js';
-import {features} from './features.js';
-import {loadIssueDescriptions} from './issue-descriptions.js';
-import {logger, saveLogsToFile} from './logger.js';
+import {
+  assertBrowserUrlAllowed,
+  configureAllowedRoots,
+  getAllowedRoots,
+} from './LocalFileAccess.js';
+import {
+  formatLogValue,
+  formatToolErrorLog,
+  logger,
+  saveLogsToFile,
+  warnAboutUnsafeDebugLogging,
+} from './logger.js';
 import {McpContext} from './McpContext.js';
 import {McpResponse} from './McpResponse.js';
 import {Mutex} from './Mutex.js';
@@ -28,16 +37,21 @@ import {
   type CallToolResult,
   SetLevelRequestSchema,
 } from './third_party/index.js';
-import {ToolCategory} from './tools/categories.js';
+import {runAbortableOperation} from './ToolCallRunner.js';
+import {normalizeToolError} from './ToolError.js';
 import * as consoleTools from './tools/console.js';
 import * as debuggerTools from './tools/debugger.js';
 import * as frameTools from './tools/frames.js';
+import * as interactionTools from './tools/interaction.js';
 import * as networkTools from './tools/network.js';
 import * as pagesTools from './tools/pages.js';
 import * as screenshotTools from './tools/screenshot.js';
 import * as scriptTools from './tools/script.js';
 import * as siteDataTools from './tools/siteData.js';
-import type {ToolDefinition} from './tools/ToolDefinition.js';
+import {
+  TOOL_OUTPUT_SCHEMA,
+  type ToolDefinition,
+} from './tools/ToolDefinition.js';
 import * as websocketTools from './tools/websocket.js';
 
 // Read the version from package.json at runtime so it never drifts from the
@@ -53,6 +67,8 @@ const VERSION = (
 ).version;
 
 export const args = parseArguments(VERSION);
+configureAllowedRoots(args.allowedRoots);
+warnAboutUnsafeDebugLogging();
 
 const logFile = args.logFile ? saveLogsToFile(args.logFile) : undefined;
 
@@ -100,112 +116,126 @@ async function getContext(): Promise<McpContext> {
 }
 
 const logDisclaimers = () => {
+  const roots = getAllowedRoots();
   console.error(
     `js-reverse-mcp exposes content of the browser instance to the MCP clients allowing them to inspect,
 debug, and modify any data in the browser or DevTools.
-Avoid sharing sensitive or personal information that you do not want to share with MCP clients.`,
+Avoid sharing sensitive or personal information that you do not want to share with MCP clients.
+
+Some tools can read from and write to the local filesystem. ${
+      roots
+        ? `Access is restricted to: ${roots.join(', ')}`
+        : 'No allowed roots are configured, so local-file access is unrestricted. Use --allowedRoots to restrict it.'
+    }`,
   );
 };
 
 const toolMutex = new Mutex();
 const DEFAULT_TOOL_TIMEOUT_MS = 35_000;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
+const PAGE_RECOVERY_TOOLS = new Set([
+  'new_page',
+  'navigate_page',
+  'select_page',
+]);
 
 function getErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function errorResult(text: string): CallToolResult {
+function errorResult(toolName: string, error: unknown): CallToolResult {
+  const normalized = normalizeToolError(error);
   return {
     content: [
       {
         type: 'text',
-        text,
+        text: `[${normalized.code}] ${normalized.message}`,
       },
     ],
+    structuredContent: {
+      ok: false,
+      tool: toolName,
+      summary: normalized.message,
+      error: {
+        code: normalized.code,
+        message: normalized.message,
+        retryable: normalized.retryable,
+      },
+    },
     isError: true,
   };
 }
 
-function withToolTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  toolName: string,
-): Promise<T> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(
-        new Error(
-          `Tool "${toolName}" timed out after ${timeoutMs}ms. If execution is paused at a breakpoint, call pause_or_resume and retry.`,
-        ),
-      );
-    }, timeoutMs);
-  });
-
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-  });
-}
-
 function registerTool(tool: ToolDefinition): void {
+  const {category, ...annotations} = tool.annotations;
   server.registerTool(
     tool.name,
     {
       description: tool.description,
       inputSchema: tool.schema,
-      annotations: tool.annotations,
+      outputSchema: tool.outputSchema ?? TOOL_OUTPUT_SCHEMA,
+      annotations,
+      _meta: {'io.github.zhizhuodemao/category': category},
     },
-    async (params): Promise<CallToolResult> => {
+    async (params, extra): Promise<CallToolResult> => {
       let guard: InstanceType<typeof Mutex.Guard>;
       try {
-        guard = await toolMutex.acquire({timeoutMs: DEFAULT_TOOL_TIMEOUT_MS});
+        guard = await toolMutex.acquire({
+          timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+          signal: extra.signal,
+        });
       } catch (error) {
-        return errorResult(getErrorText(error));
+        return errorResult(tool.name, error);
       }
 
       try {
-        return await withToolTimeout(
-          (async () => {
-            logger(
-              `${tool.name} request: ${JSON.stringify(params, null, '  ')}`,
-            );
-            const context = await getContext();
-            logger(`${tool.name} context: resolved`);
+        logger(`${tool.name} request: ${formatLogValue(params)}`);
+        // Browser startup is shared across callers and can legitimately take
+        // longer than an ordinary tool call (notably the first cloak setup).
+        // Keep the mutex until the shared start settles, then apply the tool's
+        // execution budget to the actual operation.
+        const context = await getContext();
+        logger(`${tool.name} context: resolved`);
 
-            // Navigation and browser-state tools must operate in CDP silence
-            // except for their own explicit protocol calls.
-            // Anti-bot systems detect ANY CDP activity during page load,
-            // including session creation from detectOpenDevToolsWindows().
-            if (
-              tool.annotations.category !== ToolCategory.NAVIGATION &&
-              tool.annotations.category !== ToolCategory.BROWSER_STATE
-            ) {
-              await context.ensureCollectorsInitialized();
-              await context.detectOpenDevToolsWindows();
+        const timeoutMs = tool.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+        return await runAbortableOperation(
+          async signal => {
+            signal.throwIfAborted();
+
+            if (!PAGE_RECOVERY_TOOLS.has(tool.name)) {
+              assertBrowserUrlAllowed(context.getSelectedPage().url());
             }
+            await context.ensureCapabilities(tool.capabilities ?? []);
             const response = new McpResponse();
             await tool.handler(
               {
                 params,
+                signal,
               },
               response,
               context,
             );
 
+            if (!PAGE_RECOVERY_TOOLS.has(tool.name)) {
+              assertBrowserUrlAllowed(context.getSelectedPage().url());
+            }
+
+            const content = await response.handle(tool.name, context);
             return {
-              content: await response.handle(tool.name, context),
+              content,
+              structuredContent: response.createStructuredContent(tool.name),
             };
-          })(),
-          DEFAULT_TOOL_TIMEOUT_MS,
-          tool.name,
+          },
+          {
+            timeoutMs,
+            timeoutMessage: `Tool "${tool.name}" timed out after ${timeoutMs}ms`,
+            signal: extra.signal,
+          },
         );
       } catch (err) {
-        const errorText = getErrorText(err);
-        logger(`${tool.name} error: ${errorText}`);
-        return errorResult(errorText);
+        const normalized = normalizeToolError(err);
+        logger(formatToolErrorLog(tool.name, normalized));
+        return errorResult(tool.name, normalized);
       } finally {
         guard.dispose();
       }
@@ -217,6 +247,7 @@ const tools = [
   ...Object.values(consoleTools),
   ...Object.values(debuggerTools),
   ...Object.values(frameTools),
+  ...Object.values(interactionTools),
   ...Object.values(networkTools),
   ...Object.values(pagesTools),
   ...Object.values(screenshotTools),
@@ -224,7 +255,7 @@ const tools = [
   ...Object.values(siteDataTools),
 
   ...Object.values(websocketTools),
-].filter((tool): tool is ToolDefinition => {
+].filter(tool => {
   return (
     typeof tool === 'object' &&
     tool !== null &&
@@ -233,7 +264,7 @@ const tools = [
     'schema' in tool &&
     'annotations' in tool
   );
-});
+}) as unknown as ToolDefinition[];
 
 tools.sort((a, b) => {
   return a.name.localeCompare(b.name);
@@ -330,10 +361,6 @@ process.stdout.on('error', error => {
 
 for (const tool of tools) {
   registerTool(tool);
-}
-
-if (features.issues) {
-  await loadIssueDescriptions();
 }
 
 const transport = new StdioServerTransport();

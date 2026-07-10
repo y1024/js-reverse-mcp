@@ -2,11 +2,21 @@
 
 # Chrome DevTools MCP Tool Reference
 
-- **[Navigation automation](#navigation-automation)** (3 tools)
+**Total: 24 tools.**
+
+Every tool declares an MCP output schema. Successful calls and errors raised by
+tool handlers or runtime operations return `structuredContent` with a stable
+envelope: `ok`, `tool`, `summary`, optional machine-readable `data`, and an
+`error` object (`code`, `message`, `retryable`) on failure. Protocol-level
+input validation errors use the standard MCP/JSON-RPC error response. Text
+content is kept for human-readable compatibility.
+
+- **[Navigation automation](#navigation-automation)** (4 tools)
+  - [`click_element`](#click_element)
   - [`navigate_page`](#navigate_page)
   - [`new_page`](#new_page)
   - [`select_page`](#select_page)
-- **[Browser state](#browser-state)** (1 tools)
+- **[Browser state](#browser-state)** (1 tool)
   - [`clear_site_data`](#clear_site_data)
 - **[Network](#network)** (3 tools)
   - [`clear_network_requests`](#clear_network_requests)
@@ -33,6 +43,21 @@
 
 ## Navigation automation
 
+### `click_element`
+
+**Description:** Clicks one visible element after confirm=true using a CSS selector. The selector must resolve to exactly one element unless index is explicit. Returns resolved element metadata so the action is auditable.
+
+**Parameters:**
+
+- **button** (enum: "left", "middle", "right") _(optional)_: Mouse button. Defaults to left.
+- **confirm** (boolean) _(optional)_: Must be true because a click can cause external side effects.
+- **index** (integer) _(optional)_: Explicit zero-based match index. Required when the selector matches more than one element.
+- **modifiers** (array) _(optional)_: Optional keyboard modifiers held during the click.
+- **selector** (string) **(required)**: CSS selector evaluated in the currently selected frame.
+- **timeout** (integer) _(optional)_: Maximum wait time in milliseconds. If set to 0, the default timeout will be used.
+
+---
+
 ### `navigate_page`
 
 **Description:** Navigates the currently selected page to a URL, or performs back/forward/reload navigation. This tool only navigates; it does not clear cookies, storage, cache, or site data. Waits for DOMContentLoaded event (not full page load). Default timeout is 10 seconds. After navigation, stale script IDs are cleared and fresh ones are captured automatically when the debugger is enabled. Tracked code URL breakpoints and XHR/Fetch breakpoints are restored across navigation when possible.
@@ -58,11 +83,13 @@
 
 ### `select_page`
 
-**Description:** Lists all open pages in the browser. Pass pageIdx to select a page as context for future tool calls.
+**Description:** Lists open pages, 20 per page by default. Pass pageIdx to select a page; use listPageIdx only to paginate the listing.
 
 **Parameters:**
 
+- **listPageIdx** (integer) _(optional)_: Page of the page-list to return (0-based). Defaults to 0.
 - **pageIdx** (number) _(optional)_: The index of the page to select. If omitted, lists all pages without changing selection.
+- **pageSize** (integer) _(optional)_: Maximum pages to list per response. Defaults to 20.
 
 ---
 
@@ -70,9 +97,12 @@
 
 ### `clear_site_data`
 
-**Description:** Clear browser state to create a clean replay environment for the currently selected page. This clears cookies that affect the current page's HTTP(S) frame URLs, clears browser HTTP cache, clears persistent storage for the current page's HTTP(S) frame origins, and clears sessionStorage in current page HTTP(S) frames. This tool does not reload the page. Cookie cleanup is scoped by cookie domain/path matching for the current page frames, not by all cookies in the browser context.
+**Description:** Clear browser state after confirm=true to create a clean replay environment for the selected page. This clears cookies affecting its HTTP(S) frames, persistent storage for those origins, and frame sessionStorage. It does not reload. Browser HTTP cache is global and preserved by default; opt in with clearBrowserCache only when that wider effect is intended.
 
-**Parameters:** None
+**Parameters:**
+
+- **clearBrowserCache** (boolean) _(optional)_: Also clear the browser-wide HTTP cache. This affects every page and origin in the browser, not only the selected site.
+- **confirm** (boolean) _(optional)_: Must be true to confirm deletion of cookies and origin storage for the selected page frames.
 
 ---
 
@@ -80,26 +110,28 @@
 
 ### `clear_network_requests`
 
-**Description:** Clear all collected network requests for the currently selected page, to establish a clean baseline before the action you want to study (the DevTools "clear, then act" workflow). This drops the in-memory request queue, releases the cached response-body byte budget, and clears the request initiator (call stack) maps for the page. It does not touch the browser, cookies, HTTP cache, storage, console, WebSocket messages, or any other page — use [`clear_site_data`](#clear_site_data) for browser state. reqids are not reused after clearing; newly collected requests continue from the previous high-water mark.
+**Description:** Clear all collected network requests for the currently selected page after confirm=true. This drops the in-memory request queue, releases the cached response-body byte budget, and clears initiator maps. It does not touch browser cookies, HTTP cache, storage, console, or WebSocket messages. reqids are not reused.
 
-**Parameters:** None
+**Parameters:**
+
+- **confirm** (boolean) _(optional)_: Must be true to confirm deletion of the selected page network history and cached bodies.
 
 ---
 
 ### `get_websocket_messages`
 
-**Description:** Lists WebSocket connections or gets messages for a specific connection. Without wsid, lists all connections. With wsid, gets messages. Set analyze=true to group messages by pattern. Use groupId to filter by group. Use frameIndex to get a single message's full detail by the raw frame index shown in message tables and analysis samples.
+**Description:** Lists WebSocket connections or gets messages for a specific connection. Without wsid, lists all connections. With wsid, gets messages. Set analyze=true to group messages by pattern. Use groupId to filter by group. Use frameIndex to get a single message's detail by the stable frame index shown in message tables and analysis samples.
 
 **Parameters:**
 
 - **analyze** (boolean) _(optional)_: Set to true to analyze and group messages by pattern/fingerprint. Returns statistics and sample indices for each message type.
 - **direction** (enum: "sent", "received") _(optional)_: Filter by direction: "sent" or "received".
-- **frameIndex** (integer) _(optional)_: Get a single message by its raw frame index (0-based). Use the Idx values shown by message tables or the sample indices returned by analyze=true.
+- **frameIndex** (integer) _(optional)_: Get a single retained message by its stable frame index. Indices are monotonic and may start above 0 after old frames are evicted; use the Idx values shown by message tables or analyze=true.
 - **groupId** (string) _(optional)_: Filter by group ID (A, B, C, ...). Run with analyze=true first to get group IDs; if analyze used a direction filter, pass the same direction here.
 - **includePreservedConnections** (boolean) _(optional)_: Set to true to return the preserved connections over the last 3 navigations (only for listing connections without wsid).
 - **pageIdx** (integer) _(optional)_: Page number (0-based).
 - **pageSize** (integer) _(optional)_: Messages per page (for messages mode) or connections per page (for list mode). Defaults to 10.
-- **show_content** (boolean) _(optional)_: Set to true to show full message payload. Default false (summary only) to avoid large binary output.
+- **show_content** (boolean) _(optional)_: Set to true to append payload previews (up to 10,000 characters each) for the current page of messages. Default false (summary only).
 - **urlFilter** (string) _(optional)_: Filter connections by URL (only for listing connections without wsid).
 - **wsid** (number) _(optional)_: The wsid of the WebSocket connection. If omitted, lists all connections.
 
@@ -107,16 +139,17 @@
 
 ### `list_network_requests`
 
-**Description:** List network requests for the currently selected page. Requests are held in a flat FIFO queue that is not cleared on navigation, so a request that already fired (e.g. a login POST that caused a redirect, or a pre-redirect beacon) stays inspectable after the page moves on; the queue keeps the most recent 5000 requests and the oldest roll off. To establish a clean baseline before the action you want to study (the DevTools "clear, then act" workflow), call [`clear_network_requests`](#clear_network_requests) first. Without cookieName, results are sorted newest-first and include request start time plus duration; by default returns the 20 most recent requests, and pageSize/pageIdx paginate. Narrow the normal list with filters: methods (HTTP verb, e.g. ["POST"] to find form/credential/signature submissions), resourceTypes (resource category such as xhr/fetch/document — NOT the HTTP verb), and urlFilter (URL substring). Filters combine with AND; multiple values within one filter combine with OR. With cookieName, this tool switches to Set-Cookie flow mode for that exact response cookie name: it returns every currently captured response that set/updated the cookie, oldest-first, from the first captured Set-Cookie update through the latest captured update. Set-Cookie flow ignores pageSize/pageIdx and is not capped by the default pageSize; when using cookieName, omit pageSize/pageIdx. Each flow entry shows the request id/status/method/URL and the target cookie name=value; values up to 512 chars are shown inline, longer values show only their length. Request Cookie headers are not part of this flow view; pass reqid to inspect one request, or use outputFile with outputPart="all" when exact raw headers are needed. Normal list output is an index: it shows status, summarized long URLs, and Set-Cookie names, not header/body contents. Pass reqid to inspect one request with timing, bounded inline headers where sensitive values such as Cookie, Authorization, and token-like headers are redacted, content-type-aware body previews, and a dedicated Set-Cookie section that shows cookie name=value pairs: values up to 512 chars are shown inline, longer values show only their length. When exact bytes, full bodies, replay inputs, signature inputs, large request bodies, long GET query payloads, binary responses, full headers, full Set-Cookie values, or data for external decoding are needed, pass reqid with outputFile to export the selected data. For GET requests, payload-like data means parsed URL query parameters.
+**Description:** List network requests for the currently selected page. Requests are held in a flat FIFO queue that is not cleared on navigation, so a request that already fired stays inspectable after the page moves on; the queue keeps the most recent 5000 requests. List and Set-Cookie flow modes both default to 20 items per page and use pageSize/pageIdx. Filters combine with AND; multiple values within one filter combine with OR. Pass reqid for bounded details, or reqid plus outputFile for exact export data.
 
 **Parameters:**
 
+- **confirmOverwrite** (boolean) _(optional)_: Must be true when outputFile already exists. New files do not require confirmation.
+- **cookieName** (string) _(optional)_: Switch to Set-Cookie flow mode for an exact response cookie name. Returns matching responses oldest-first using the same pageSize/pageIdx pagination. Does not match request Cookie headers.
 - **methods** (array) _(optional)_: Filter requests by HTTP method (the request verb). Matched case-insensitively. Pass one or more of GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS; multiple values are OR-ed (e.g. ["POST"] shows only POSTs, ["GET","POST"] shows both). Use this to hunt for submissions (POST/PUT/PATCH) versus reads (GET). This is the HTTP verb, distinct from resourceTypes which filters by resource category (xhr, document, ...). When omitted or empty, methods are not filtered.
-- **cookieName** (string) _(optional)_: Switch to Set-Cookie flow mode for an exact response cookie name. Returns all currently captured responses that set/update this cookie, oldest-first, and shows the target cookie name=value for each update. Do not pass pageSize/pageIdx with cookieName; Set-Cookie flow ignores pagination and returns all matching captured updates. Does not match request Cookie headers.
-- **outputFile** (string) _(optional)_: When reqid is provided, save network data to this local file instead of returning only inline text. Use this for exact bytes, large bodies, long GET query payloads, binary responses, replay/signature inputs, or data that will be decoded with external tools. Absolute paths and paths relative to the current working directory are supported. The response reports the resolved absolute path; use that path with [`evaluate_script`](#evaluate_script) localFilePath when browser-side processing is needed.
+- **outputFile** (string) _(optional)_: When reqid is provided, save network data to this local file instead of returning only inline text. Use this for exact bytes, large bodies, long GET query payloads, binary responses, replay/signature inputs, or data that will be decoded with external tools. Absolute paths and paths relative to the current working directory are supported. The response reports the resolved absolute path; use that path with [`evaluate_script`](#evaluate_script) localFilePath when browser-side processing is needed. Subject to --allowedRoots when configured.
 - **outputPart** (enum: "all", "responseHeaders", "responseBody", "requestBody", "queryParams") _(optional)_: Which part to export when outputFile is provided. "responseHeaders" saves response headers as JSON while preserving repeated headers such as Set-Cookie, "responseBody" saves raw response bytes, "requestBody" saves captured request body bytes, "queryParams" saves parsed URL query parameters as JSON, and "all" saves a JSON bundle with metadata, headers, query params, and body content/metadata. Defaults to "all".
-- **pageIdx** (integer) _(optional)_: Page number to return for the normal network list (0-based). When omitted, returns the first page. Ignored when cookieName is provided because Set-Cookie flow returns all matching captured updates.
-- **pageSize** (integer) _(optional)_: Maximum number of requests to return for the normal network list. Defaults to 20. Ignored when cookieName is provided because Set-Cookie flow returns all matching captured updates.
+- **pageIdx** (integer) _(optional)_: Page number to return (0-based). When omitted, returns the first page.
+- **pageSize** (integer) _(optional)_: Maximum number of requests or Set-Cookie flow updates to return. Defaults to 20.
 - **reqid** (number) _(optional)_: The reqid of a specific network request to get full details for. If omitted, lists all requests.
 - **resourceTypes** (array) _(optional)_: Filter requests to only return requests of the specified resource types (xhr, fetch, document, script, ...). This is the resource category, NOT the HTTP verb — use methods for GET/POST filtering. When omitted or empty, returns all requests.
 - **urlFilter** (string) _(optional)_: Filter requests by URL. Only requests containing this substring will be returned.
@@ -128,10 +161,12 @@
 ### `evaluate_script`
 
 **Description:** Evaluate a JavaScript function inside the currently selected page. Returns the response as JSON
-so returned values have to JSON-serializable. Inline JSON results are bounded; use outputFile for exact large results. When execution is paused at a breakpoint, automatically evaluates in the paused call frame context. Use localFilePath when the function needs one local data file, commonly a network body or JSON exported by another tool. The MCP server reads the file and passes it as localFile; browser JavaScript does not read local paths.
+so returned values have to JSON-serializable. Inline JSON results are bounded; use outputFile for exact large results. When execution is paused at a breakpoint, automatically evaluates in the paused call frame context. Use localFilePath when the function needs one local data file, commonly a network body or JSON exported by another tool. The MCP server reads the file and passes it as localFile; browser JavaScript does not read local paths. Local-file access can expose host data and is restricted by --allowedRoots when configured.
 
 **Parameters:**
 
+- **confirm** (boolean) _(optional)_: Must be true because arbitrary page JavaScript can modify browser state, send network requests, or trigger external side effects.
+- **confirmOverwrite** (boolean) _(optional)_: Must be true when outputFile already exists. New files do not require confirmation.
 - **frameIndex** (integer) _(optional)_: When paused at a breakpoint, which call frame to evaluate in (0 = top frame). If omitted, uses the top frame. Use [`get_paused_info`](#get_paused_info) to see available frames.
 - **function** (string) **(required)**: A JavaScript function declaration to be executed by the tool in the currently selected page.
   Example without arguments: `() => {
@@ -141,33 +176,35 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
 }`.
   If localFilePath is provided, the function receives one argument: `async ({ localFile }) => { ... }`. Use localFile.text when present for UTF-8 text/JSON and localFile.base64 for exact bytes. To keep data for later calls, assign it explicitly in JavaScript, for example `window.__mcpPayload = JSON.parse(localFile.text)` with mainWorld=true.
 
-- **localFilePath** (string) _(optional)_: Absolute path to one local file to pass to the evaluated function as localFile. Relative paths, file:// URLs, globs, ~, and directories are rejected. If provided, write the function as async ({ localFile }) => { ... }. Use localFile.text when present for UTF-8 text/JSON and localFile.base64 for exact bytes.
+- **localFilePath** (string) _(optional)_: Absolute path to one local file to pass to the evaluated function as localFile. Relative paths, file:// URLs, globs, ~, and directories are rejected. If provided, write the function as async ({ localFile }) => { ... }. Use localFile.text when present for UTF-8 text/JSON and localFile.base64 for exact bytes. Subject to --allowedRoots when configured.
 - **mainWorld** (boolean) _(optional)_: Execute the function in the page main world instead of the default isolated context. Use this when you need to access page-defined globals (e.g. window.bdms, window.app). Async functions are supported, and returned values must be JSON-serializable unless outputFile is used for binary data.
-- **outputFile** (string) _(optional)_: If provided, saves the evaluation result to this local file path instead of returning it in the chat. JSON-serializable results are saved as JSON text; ArrayBuffer and Uint8Array results are saved as raw bytes. Useful for dumping large data or binary memory regions. The response reports the resolved absolute path.
+- **outputFile** (string) _(optional)_: If provided, saves the evaluation result to this local file path instead of returning it in the chat. JSON-serializable results are saved as JSON text; ArrayBuffer and Uint8Array results are saved as raw bytes. Useful for dumping large data or binary memory regions. The response reports the resolved absolute path. Subject to --allowedRoots when configured.
 
 ---
 
 ### `list_console_messages`
 
-**Description:** List all console messages for the currently selected page since the last navigation. Pass msgid to get a single message by its ID.
+**Description:** List console messages for the selected page, 20 per page by default. Pass msgid to get one message by stable ID.
 
 **Parameters:**
 
 - **includePreservedMessages** (boolean) _(optional)_: Set to true to return the preserved messages over the last 3 navigations.
 - **msgid** (number) _(optional)_: The msgid of a console message on the page from the listed console messages
 - **pageIdx** (integer) _(optional)_: Page number to return (0-based). When omitted, returns the first page.
-- **pageSize** (integer) _(optional)_: Maximum number of messages to return. When omitted, returns all messages.
+- **pageSize** (integer) _(optional)_: Maximum number of messages to return. Defaults to 20.
 - **types** (array) _(optional)_: Filter messages to only return messages of the specified console message types. When omitted or empty, returns all messages.
 
 ---
 
 ### `select_frame`
 
-**Description:** Lists all frames (including iframes) in the current page. Pass frameIdx to switch the execution context used by [`evaluate_script`](#evaluate_script). Other tools may still operate at page level.
+**Description:** Lists frames (including iframes), 20 per page by default. Pass frameIdx to switch [`evaluate_script`](#evaluate_script) context; use listPageIdx only to paginate the listing.
 
 **Parameters:**
 
 - **frameIdx** (integer) _(optional)_: The frame index to select. 0 = main frame. If omitted, lists all frames without changing selection.
+- **listPageIdx** (integer) _(optional)_: Page of the frame-list to return (0-based). Defaults to 0.
+- **pageSize** (integer) _(optional)_: Maximum frames to list per response. Defaults to 20.
 
 ---
 
@@ -177,7 +214,8 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
 
 **Parameters:**
 
-- **filePath** (string) _(optional)_: The absolute path, or a path relative to the current working directory, to save the screenshot to instead of attaching it to the response.
+- **confirmOverwrite** (boolean) _(optional)_: Must be true when filePath already exists. New files do not require confirmation.
+- **filePath** (string) _(optional)_: The absolute path, or a path relative to the current working directory, to save the screenshot to instead of attaching it to the response. Subject to --allowedRoots when configured.
 - **format** (enum: "png", "jpeg") _(optional)_: Type of format to save the screenshot as. Default is "png"
 - **fullPage** (boolean) _(optional)_: If set to true, captures the full page instead of the currently visible viewport.
 - **quality** (number) _(optional)_: Compression quality for JPEG format (0-100). Higher values mean better quality but larger file sizes. Ignored for PNG format.
@@ -235,37 +273,46 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
 
 ### `list_breakpoints`
 
-**Description:** Lists active code breakpoints and XHR/Fetch URL breakpoints in the current debugging session. Breakpoints are tracked by this MCP session and restored after reload/goto/back/forward when possible.
+**Description:** Lists active code and XHR/Fetch breakpoints, 20 per page by default. Breakpoints are tracked by this MCP session and restored after navigation when possible.
 
-**Parameters:** None
+**Parameters:**
+
+- **pageIdx** (integer) _(optional)_: Page number (0-based). Defaults to 0.
+- **pageSize** (integer) _(optional)_: Maximum items per page. Defaults to 20.
 
 ---
 
 ### `list_scripts`
 
-**Description:** Lists all JavaScript scripts loaded in the current page. Returns script ID, URL, and source map information. Use this to find scripts before setting breakpoints or searching. Script IDs are valid for the current page load only; after navigation, call [`list_scripts`](#list_scripts) again or prefer script URLs for follow-up tools.
+**Description:** Lists loaded JavaScript scripts, including inline and eval scripts. Returns 20 per page by default with script ID, URL/kind, and source map information. Script IDs are valid only for the current page load.
 
 **Parameters:**
 
 - **filter** (string) _(optional)_: Optional filter string to match against script URLs (case-insensitive partial match).
+- **pageIdx** (integer) _(optional)_: Page number (0-based). Defaults to 0.
+- **pageSize** (integer) _(optional)_: Maximum items per page. Defaults to 20.
 
 ---
 
 ### `pause_or_resume`
 
-**Description:** Toggles JavaScript execution. If paused, resumes execution. If running, requests a pause at the next JavaScript statement.
+**Description:** Explicitly pauses or resumes JavaScript execution. Pass action="pause" or action="resume"; the tool never toggles implicitly.
 
-**Parameters:** None
+**Parameters:**
+
+- **action** (enum: "pause", "resume") **(required)**: Explicit execution action: pause or resume.
 
 ---
 
 ### `remove_breakpoint`
 
-**Description:** Removes breakpoints. Pass breakpointId to remove a code breakpoint, url to remove an XHR breakpoint, or neither to remove ALL breakpoints (code + XHR).
+**Description:** Removes breakpoints using an explicit action. Use remove_code with breakpointId, remove_xhr with url, or remove_all with confirm=true.
 
 **Parameters:**
 
+- **action** (enum: "remove_code", "remove_xhr", "remove_all") **(required)**: Explicit breakpoint removal action.
 - **breakpointId** (string) _(optional)_: The breakpoint ID to remove (from [`list_breakpoints`](#list_breakpoints) or [`set_breakpoint_on_text`](#set_breakpoint_on_text)).
+- **confirm** (boolean) _(optional)_: Must be true for any breakpoint removal action.
 - **url** (string) _(optional)_: The XHR breakpoint URL pattern to remove.
 
 ---
@@ -276,7 +323,8 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
 
 **Parameters:**
 
-- **filePath** (string) **(required)**: Local file path to save the script source to. Absolute paths and paths relative to the current working directory are supported. Use a .js/.mjs/.cjs/.jsx/.ts/.tsx extension to enable auto-format (prettier beautify); other extensions save raw source verbatim. For WASM scripts, use a .wasm extension.
+- **confirmOverwrite** (boolean) _(optional)_: Must be true when filePath already exists. New files do not require confirmation.
+- **filePath** (string) **(required)**: Local file path to save the script source to. Absolute paths and paths relative to the current working directory are supported. Use a .js/.mjs/.cjs/.jsx/.ts/.tsx extension to enable auto-format (prettier beautify); other extensions save raw source verbatim. For WASM scripts, use a .wasm extension. Subject to --allowedRoots when configured.
 - **format** (boolean) _(optional)_: Auto-format JavaScript/TypeScript output with prettier (beautifies minified code). Defaults to true. Set to false to save the raw original source verbatim.
 - **scriptId** (string) _(optional)_: Script ID (from [`list_scripts`](#list_scripts)). Becomes invalid after page navigation — prefer url instead.
 - **url** (string) _(optional)_: Script URL (preferred). Stable across page navigations. Exact match first, then substring match.
@@ -285,12 +333,12 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
 
 ### `search_in_sources`
 
-**Description:** Searches for a string or regex pattern in all loaded JavaScript sources. Returns matching lines with script ID, URL, and line number. Use [`get_script_source`](#get_script_source) with startLine/endLine to view full context around matches.
+**Description:** Searches all loaded JavaScript sources, including inline/eval and compressed bundles by default. Returns matching lines with script ID, URL/kind, and line number. Use [`get_script_source`](#get_script_source) for surrounding context.
 
 **Parameters:**
 
 - **caseSensitive** (boolean) _(optional)_: Whether the search should be case-sensitive.
-- **excludeMinified** (boolean) _(optional)_: Skip minified files (files with very long lines). Default: true.
+- **excludeMinified** (boolean) _(optional)_: Skip minified files (files with very long lines). Default: false so compressed bundles are searched automatically.
 - **isRegex** (boolean) _(optional)_: Whether to treat the query as a regular expression.
 - **maxLineLength** (integer) _(optional)_: Maximum characters per matched line preview (default: 150). Increase if you need more context around the match.
 - **maxResults** (integer) _(optional)_: Maximum number of results to return (default: 30).
@@ -321,3 +369,26 @@ so returned values have to JSON-serializable. Inline JSON results are bounded; u
 - **direction** (enum: "over", "into", "out") **(required)**: [`Step`](#step) direction: "over" (next statement), "into" (enter function), "out" (exit function).
 
 ---
+
+## CLI Configuration
+
+- **`--browserUrl`, `-u`**
+  Connect to a running Chrome instance via CDP HTTP endpoint (e.g., http://127.0.0.1:9222). The MCP will probe the endpoint to find the WebSocket debugger URL.
+  - **Type:** string
+
+- **`--isolated`**
+  Create a temporary user-data-dir that is auto-cleaned when the browser closes. Use this for runs where you do NOT want cookies/localStorage to persist into your default profile.
+  - **Type:** boolean
+  - **Default:** `false`
+
+- **`--logFile`**
+  Path to a 0600 regular file for js-reverse-mcp debug logs. Use DEBUG=mcp:_ for verbose MCP logs; never use DEBUG=_ because browser protocol logs can contain page data, cookies, scripts, and credentials.
+  - **Type:** string
+
+- **`--allowedRoots`**
+  Optional directories that local-file tools may read from or write to. Repeat the flag for multiple roots. Roots are resolved at startup and symlink escapes are rejected. While configured, file:, view-source:file:, and filesystem:file: browser pages are disabled. When omitted, local-file access is unrestricted and a security warning is printed.
+  - **Type:** string[]
+
+- **`--cloak`**
+  Use CloakBrowser stealth-patched Chromium instead of system Chrome. Adds source-level fingerprint patches (canvas/WebGL/audio/GPU). Binary auto-downloads (~200MB) on first use. Identity is persisted per profile in <profile>/.cloak-seed.
+  - **Type:** boolean

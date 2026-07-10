@@ -27,11 +27,7 @@ export default defineConfig([
 
       parserOptions: {
         projectService: {
-          allowDefaultProject: [
-            '.prettierrc.cjs',
-            'eslint.config.mjs',
-            'rollup.config.mjs',
-          ],
+          allowDefaultProject: ['.prettierrc.cjs', 'eslint.config.mjs'],
         },
       },
 
@@ -112,19 +108,6 @@ export default defineConfig([
 
       '@stylistic/function-call-spacing': 'error',
       '@stylistic/semi': 'error',
-
-      'no-restricted-imports': [
-        'error',
-        {
-          patterns: [
-            {
-              regex: '.*chrome-devtools-frontend/(?!mcp/mcp.js$).*',
-              message:
-                'Import only the devtools-frontend code exported via node_modules/chrome-devtools-frontend/mcp/mcp.js',
-            },
-          ],
-        },
-      ],
     },
   },
   {

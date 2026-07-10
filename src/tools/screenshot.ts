@@ -40,7 +40,13 @@ export const screenshot = defineTool({
       .string()
       .optional()
       .describe(
-        'The absolute path, or a path relative to the current working directory, to save the screenshot to instead of attaching it to the response.',
+        'The absolute path, or a path relative to the current working directory, to save the screenshot to instead of attaching it to the response. Subject to --allowedRoots when configured.',
+      ),
+    confirmOverwrite: zod
+      .boolean()
+      .default(false)
+      .describe(
+        'Must be true when filePath already exists. New files do not require confirmation.',
       ),
   },
   handler: async (request, response, context) => {
@@ -66,18 +72,38 @@ export const screenshot = defineTool({
     }
 
     if (request.params.filePath) {
-      const file = await context.saveFile(screenshot, request.params.filePath);
+      const file = await context.saveFile(screenshot, request.params.filePath, {
+        confirmOverwrite: request.params.confirmOverwrite,
+      });
       response.appendResponseLine(`Saved screenshot to ${file.filename}.`);
+      response.setStructuredContent({
+        format,
+        fullPage: request.params.fullPage ?? false,
+        byteLength: screenshot.length,
+        filename: file.filename,
+      });
     } else if (screenshot.length >= 2_000_000) {
       const {filename} = await context.saveTemporaryFile(
         screenshot,
         `image/${request.params.format}`,
       );
       response.appendResponseLine(`Saved screenshot to ${filename}.`);
+      response.setStructuredContent({
+        format,
+        fullPage: request.params.fullPage ?? false,
+        byteLength: screenshot.length,
+        filename,
+      });
     } else {
       response.attachImage({
         mimeType: `image/${request.params.format}`,
         data: Buffer.from(screenshot).toString('base64'),
+      });
+      response.setStructuredContent({
+        format,
+        fullPage: request.params.fullPage ?? false,
+        byteLength: screenshot.length,
+        attached: true,
       });
     }
   },

@@ -34,7 +34,13 @@ export const cliOptions = {
   logFile: {
     type: 'string',
     describe:
-      'Path to a file to write debug logs to. Set the env variable `DEBUG` to `*` to enable verbose logs. Useful for submitting bug reports.',
+      'Path to a 0600 regular file for js-reverse-mcp debug logs. Use DEBUG=mcp:* for verbose MCP logs; never use DEBUG=* because browser protocol logs can contain page data, cookies, scripts, and credentials.',
+  },
+  allowedRoots: {
+    type: 'string',
+    array: true,
+    description:
+      'Optional directories that local-file tools may read from or write to. Repeat the flag for multiple roots. Roots are resolved at startup and symlink escapes are rejected. While configured, file:, view-source:file:, and filesystem:file: browser pages are disabled. When omitted, local-file access is unrestricted and a security warning is printed.',
   },
   cloak: {
     type: 'boolean',
@@ -72,6 +78,10 @@ export function parseArguments(version: string, argv = process.argv) {
         'Connect to a running Chrome instance instead of launching a new one',
       ],
       ['$0 --logFile /tmp/log.txt', 'Save debug logs to a file'],
+      [
+        '$0 --allowedRoots /workspace --allowedRoots /tmp/captures',
+        'Restrict local-file reads and writes to explicit directories',
+      ],
       ['$0 --help', 'Print CLI options'],
     ]);
 

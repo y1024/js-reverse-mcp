@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {Buffer} from 'node:buffer';
+
 import type {
   WebSocketConnection,
   WebSocketData,
@@ -123,7 +125,7 @@ export function formatWebSocketConnectionVerbose(
  */
 export function formatWebSocketFrameDetail(
   frame: WebSocketFrame,
-  index: number,
+  index: number = frame.index,
 ): string[] {
   const lines: string[] = [];
 
@@ -186,7 +188,8 @@ function formatPayload(
     // Binary data
     const truncated = payload.length > sizeLimit;
     const displayPayload = truncated ? payload.slice(0, sizeLimit) : payload;
-    return `<binary: ${payload.length} bytes>${truncated ? ' (truncated)' : ''}\n${displayPayload}`;
+    const payloadBytes = Buffer.from(payload, 'base64').length;
+    return `<binary: ${payloadBytes} bytes>${truncated ? ' (base64 preview truncated)' : ''}\n${displayPayload}`;
   }
 
   // Text data - try to format as JSON if possible
@@ -234,8 +237,8 @@ function base64ToHex(base64: string, maxBytes = 4): string {
  * Get first 4 bytes as hex string
  */
 function getHead4B(payload: string, opcode: number): string {
-  if (opcode === 2 || payload.match(/^[A-Za-z0-9+/]+=*$/)) {
-    // Binary or base64
+  if (opcode === 2) {
+    // CDP represents binary WebSocket payloads as base64.
     return base64ToHex(payload, 4);
   }
   // Text - convert first 4 chars to hex
@@ -381,9 +384,9 @@ export function analyzeWebSocketFramesV2(
   >();
 
   frames.forEach((frame, index) => {
-    const frameIndex = frameIndices?.[index] ?? index;
+    const frameIndex = frameIndices?.[index] ?? frame.index;
     const head4B = getHead4B(frame.payloadData, frame.opcode);
-    const size = frame.payloadData.length;
+    const size = frame.payloadBytes;
     const sizeCategory = getSizeCategory(size);
     const key = `${frame.direction}:${head4B}:${sizeCategory}`;
 
@@ -505,8 +508,9 @@ export function formatGroupMessages(
     return lines;
   }
 
+  const framesByIndex = new Map(frames.map(frame => [frame.index, frame]));
   // Use first frame timestamp as base
-  const baseTimestamp = frames[indices[0]]?.timestamp ?? 0;
+  const baseTimestamp = framesByIndex.get(indices[0])?.timestamp ?? 0;
   lines.push(
     `Base: ${new Date(baseTimestamp).toISOString().split('T')[1].slice(0, 12)}`,
   );
@@ -516,12 +520,12 @@ export function formatGroupMessages(
   lines.push(`|-----|-------|------|`);
 
   for (const idx of paginatedIndices) {
-    const frame = frames[idx];
+    const frame = framesByIndex.get(idx);
     if (!frame) continue;
 
     const deltaMs = frame.timestamp - baseTimestamp;
     const timeDelta = formatTimeDelta(deltaMs);
-    const size = formatSize(frame.payloadData.length);
+    const size = formatSize(frame.payloadBytes);
 
     lines.push(`| ${idx} | ${timeDelta} | ${size} |`);
   }
@@ -568,11 +572,11 @@ export function formatRecentMessages(
 
   for (let i = 0; i < paginatedFrames.length; i++) {
     const frame = paginatedFrames[i];
-    const frameIdx = options?.frameIndices?.[offset + i] ?? offset + i;
+    const frameIdx = options?.frameIndices?.[offset + i] ?? frame.index;
     const dir = frame.direction === 'sent' ? '↑' : '↓';
     const deltaMs = frame.timestamp - baseTimestamp;
     const timeDelta = formatTimeDelta(deltaMs);
-    const size = formatSize(frame.payloadData.length);
+    const size = formatSize(frame.payloadBytes);
     const head = getHead4B(frame.payloadData, frame.opcode);
     const headStr = head ? `\`${head}\`` : '-';
 

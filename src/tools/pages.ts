@@ -4,17 +4,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {assertBrowserUrlAllowed} from '../LocalFileAccess.js';
 import {zod} from '../third_party/index.js';
+import {normalizeToolError, ToolError} from '../ToolError.js';
 
 import {ToolCategory} from './categories.js';
-import {defineTool, timeoutSchema} from './ToolDefinition.js';
+import {
+  createToolOutputSchema,
+  defineTool,
+  PAGINATION_OUTPUT_SCHEMA,
+  timeoutSchema,
+} from './ToolDefinition.js';
 
 // Default navigation timeout in milliseconds (10 seconds)
 const DEFAULT_NAV_TIMEOUT = 10000;
 const PAUSE_POLL_INTERVAL_MS = 50;
 
-export type NavigationWaitResult =
-  | {status: 'completed'}
+export type NavigationWaitResult<T = unknown> =
+  | {status: 'completed'; value: T}
   | {status: 'paused'}
   | {status: 'error'; error: unknown};
 
@@ -27,12 +34,24 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export async function waitForNavigationOrPause(
-  navigation: Promise<unknown>,
+function throwNavigationFailure(error: unknown): never {
+  const normalized = normalizeToolError(error);
+  if (normalized.code !== 'INTERNAL') {
+    throw normalized;
+  }
+  throw new ToolError('CDP_ERROR', `Navigation failed: ${normalized.message}`, {
+    cause: error,
+    retryable: true,
+  });
+}
+
+export async function waitForNavigationOrPause<T>(
+  navigation: Promise<T>,
   debugger_: PauseStateReader,
-): Promise<NavigationWaitResult> {
+  stopNavigation: () => Promise<void>,
+): Promise<NavigationWaitResult<T>> {
   const navigationResult = navigation.then(
-    () => ({status: 'completed'}) as const,
+    value => ({status: 'completed', value}) as const,
     error => ({status: 'error', error}) as const,
   );
 
@@ -41,32 +60,58 @@ export async function waitForNavigationOrPause(
   }
 
   let stopped = false;
-  const pauseResult = (async (): Promise<NavigationWaitResult> => {
+  const pauseResult = (async (): Promise<NavigationWaitResult<T>> => {
     while (!stopped) {
       if (debugger_.isPaused()) {
         return {status: 'paused'};
       }
       await delay(PAUSE_POLL_INTERVAL_MS);
     }
-    return {status: 'completed'};
+    // The loop only stops after another raced branch has resolved. This value
+    // is never selected, but keeps the polling task finite.
+    return {status: 'completed', value: undefined as T};
   })();
 
   const result = await Promise.race([navigationResult, pauseResult]);
   stopped = true;
+  if (result.status === 'paused') {
+    await stopNavigation().catch(() => undefined);
+    // Page.stopLoading normally settles the Playwright navigation immediately.
+    // Even if it fails, goto/reload carries its own bounded timeout. Drain it so
+    // the tool mutex is never released while the navigation is still running.
+    await navigationResult;
+  }
   return result;
 }
 
-function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+async function rebuildScriptsAfterNavigationFailure(
+  context: {reinitDebugger(): Promise<void>},
+  debugger_: PauseStateReader,
+): Promise<void> {
+  if (debugger_.isEnabled()) {
+    await context.reinitDebugger();
+  }
 }
 
 export const selectPage = defineTool({
   name: 'select_page',
-  description: `Lists all open pages in the browser. Pass pageIdx to select a page as context for future tool calls.`,
+  description: `Lists open pages, 20 per page by default. Pass pageIdx to select a page; use listPageIdx only to paginate the listing.`,
   annotations: {
     category: ToolCategory.NAVIGATION,
     readOnlyHint: false,
   },
+  outputSchema: createToolOutputSchema({
+    pages: zod
+      .array(
+        zod.object({
+          pageIdx: zod.number().int(),
+          url: zod.string(),
+          selected: zod.boolean(),
+        }),
+      )
+      .optional(),
+    pagination: PAGINATION_OUTPUT_SCHEMA.optional(),
+  }),
   schema: {
     pageIdx: zod
       .number()
@@ -74,19 +119,40 @@ export const selectPage = defineTool({
       .describe(
         'The index of the page to select. If omitted, lists all pages without changing selection.',
       ),
+    pageSize: zod
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe('Maximum pages to list per response. Defaults to 20.'),
+    listPageIdx: zod
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe('Page of the page-list to return (0-based). Defaults to 0.'),
   },
   handler: async (request, response, context) => {
     if (request.params.pageIdx === undefined) {
       // List mode
-      response.setIncludePages(true);
+      response.setIncludePages(true, {
+        pageSize: request.params.pageSize,
+        pageIdx: request.params.listPageIdx,
+      });
       return;
     }
 
     // Select mode
     const page = context.getPageByIdx(request.params.pageIdx);
+    assertBrowserUrlAllowed(page.url());
     await page.bringToFront();
-    context.selectPage(page);
-    response.setIncludePages(true);
+    await context.selectPage(page);
+    response.setIncludePages(true, {
+      pageSize: request.params.pageSize,
+      pageIdx:
+        request.params.listPageIdx ??
+        Math.floor(request.params.pageIdx / (request.params.pageSize ?? 20)),
+    });
   },
 });
 
@@ -105,6 +171,7 @@ export const newPage = defineTool({
     ...timeoutSchema,
   },
   handler: async (request, response, context) => {
+    assertBrowserUrlAllowed(request.params.url);
     // launchPersistentContext opens an initial about:blank tab on startup.
     // If a blank tab is still around (either the startup one or an explicitly
     // requested one), navigate it in place instead of opening another tab —
@@ -114,7 +181,7 @@ export const newPage = defineTool({
       .find(p => p.url() === 'about:blank');
     const page = existingBlank ?? (await context.newPage());
     if (existingBlank) {
-      context.selectPage(existingBlank);
+      await context.selectPage(existingBlank);
     }
 
     // Use plain goto without waitForEventsAfterAction to avoid creating
@@ -125,6 +192,7 @@ export const newPage = defineTool({
       waitUntil: 'domcontentloaded',
       referer: DEFAULT_REFERER,
     });
+    assertBrowserUrlAllowed(page.url());
 
     response.setIncludePages(true);
   },
@@ -160,8 +228,18 @@ export const navigatePage = defineTool({
     if (!request.params.type) {
       request.params.type = 'url';
     }
+    if (request.params.type === 'url') {
+      if (!request.params.url) {
+        throw new ToolError(
+          'INVALID_ARGUMENT',
+          'A URL is required for navigation of type=url.',
+        );
+      }
+      assertBrowserUrlAllowed(request.params.url);
+    }
 
     const debugger_ = context.debuggerContext;
+    const urlBeforeNavigation = page.url();
 
     // Clear stale script IDs BEFORE navigation. The scriptParsed listener
     // remains active and will capture new scripts as the page loads.
@@ -184,34 +262,37 @@ export const navigatePage = defineTool({
 
     switch (request.params.type) {
       case 'url':
-        if (!request.params.url) {
-          throw new Error('A URL is required for navigation of type=url.');
-        }
         {
+          const targetUrl = request.params.url!;
           const result = await waitForNavigationOrPause(
-            page.goto(request.params.url, {
+            page.goto(targetUrl, {
               ...options,
               waitUntil: 'domcontentloaded',
               referer: DEFAULT_REFERER,
             }),
             debugger_,
+            () => context.stopPageLoading(page),
           );
           if (result.status === 'completed') {
+            if (result.value === null) {
+              // Successful same-document and non-HTTP navigations can return
+              // null without replaying scriptParsed for existing scripts.
+              await rebuildScriptsAfterNavigationFailure(context, debugger_);
+            }
             navigationCompleted = true;
             response.appendResponseLine(
-              `Successfully navigated to ${request.params.url}.`,
+              `Successfully navigated to ${targetUrl}.`,
             );
             response.appendResponseLine(
               'Note: Any previously obtained script IDs are now invalid. Use script URLs instead.',
             );
           } else if (result.status === 'paused' || debugger_.isPaused()) {
             response.appendResponseLine(
-              `Navigation to ${request.params.url} started but execution is paused at a breakpoint. Use get_paused_info to inspect, then resume to continue loading.`,
+              `Navigation to ${targetUrl} started but execution is paused at a breakpoint. Use get_paused_info to inspect, then resume to continue loading.`,
             );
           } else {
-            response.appendResponseLine(
-              `Unable to navigate in the selected page: ${getErrorMessage(result.error)}.`,
-            );
+            await rebuildScriptsAfterNavigationFailure(context, debugger_);
+            throwNavigationFailure(result.error);
           }
         }
         break;
@@ -223,8 +304,18 @@ export const navigatePage = defineTool({
               waitUntil: 'domcontentloaded',
             }),
             debugger_,
+            () => context.stopPageLoading(page),
           );
           if (result.status === 'completed') {
+            if (result.value === null) {
+              await rebuildScriptsAfterNavigationFailure(context, debugger_);
+              if (page.url() === urlBeforeNavigation) {
+                throw new ToolError(
+                  'PRECONDITION_FAILED',
+                  'The page has no previous history entry to navigate to.',
+                );
+              }
+            }
             navigationCompleted = true;
             response.appendResponseLine(
               `Successfully navigated back to ${page.url()}.`,
@@ -237,9 +328,8 @@ export const navigatePage = defineTool({
               `Navigation back started but execution is paused at a breakpoint. Use get_paused_info to inspect, then resume to continue loading.`,
             );
           } else {
-            response.appendResponseLine(
-              `Unable to navigate back in the selected page: ${getErrorMessage(result.error)}.`,
-            );
+            await rebuildScriptsAfterNavigationFailure(context, debugger_);
+            throwNavigationFailure(result.error);
           }
         }
         break;
@@ -251,8 +341,18 @@ export const navigatePage = defineTool({
               waitUntil: 'domcontentloaded',
             }),
             debugger_,
+            () => context.stopPageLoading(page),
           );
           if (result.status === 'completed') {
+            if (result.value === null) {
+              await rebuildScriptsAfterNavigationFailure(context, debugger_);
+              if (page.url() === urlBeforeNavigation) {
+                throw new ToolError(
+                  'PRECONDITION_FAILED',
+                  'The page has no next history entry to navigate to.',
+                );
+              }
+            }
             navigationCompleted = true;
             response.appendResponseLine(
               `Successfully navigated forward to ${page.url()}.`,
@@ -265,9 +365,8 @@ export const navigatePage = defineTool({
               `Navigation forward started but execution is paused at a breakpoint. Use get_paused_info to inspect, then resume to continue loading.`,
             );
           } else {
-            response.appendResponseLine(
-              `Unable to navigate forward in the selected page: ${getErrorMessage(result.error)}.`,
-            );
+            await rebuildScriptsAfterNavigationFailure(context, debugger_);
+            throwNavigationFailure(result.error);
           }
         }
         break;
@@ -279,8 +378,12 @@ export const navigatePage = defineTool({
               waitUntil: 'domcontentloaded',
             }),
             debugger_,
+            () => context.stopPageLoading(page),
           );
           if (result.status === 'completed') {
+            if (result.value === null) {
+              await rebuildScriptsAfterNavigationFailure(context, debugger_);
+            }
             navigationCompleted = true;
             response.appendResponseLine(`Successfully reloaded the page.`);
             response.appendResponseLine(
@@ -291,13 +394,14 @@ export const navigatePage = defineTool({
               `Page reload started but execution is paused at a breakpoint. Use get_paused_info to inspect, then resume to continue loading.`,
             );
           } else {
-            response.appendResponseLine(
-              `Unable to reload the selected page: ${getErrorMessage(result.error)}.`,
-            );
+            await rebuildScriptsAfterNavigationFailure(context, debugger_);
+            throwNavigationFailure(result.error);
           }
         }
         break;
     }
+
+    assertBrowserUrlAllowed(page.url());
 
     // Restore XHR breakpoints after navigation — Chrome resets
     // DOMDebugger state on page navigation.

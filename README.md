@@ -113,12 +113,12 @@ npm run build
 
 反检测是 js-reverse-mcp 的底层支撑能力之一。包装层（这个 MCP 自己）**零 JS 注入**、不做 `Object.defineProperty` hack（那本身就是检测信号）。所有反检测都在两个互不重叠的层：
 
-| 层                             | 默认模式                                                                                                        | `--cloak` 模式                                                                                                    |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| **协议层**（CDP）              | Patchright：不调 `Runtime.enable` / `Console.enable`，在 isolated world 里执行 evaluate，移除自动化 launch flag | 同                                                                                                                |
-| **源码层**（C++ 二进制 patch） | 无 —— 直接用系统 Google Chrome                                                                                  | CloakBrowser 二进制（49 个 C++ patch：`navigator.webdriver`、canvas、WebGL、audio、GPU、字体、屏幕、WebRTC、TLS） |
-| **Profile 目录**               | `~/.cache/chrome-devtools-mcp/chrome-profile`（持久化登录态）                                                   | `~/.cache/chrome-devtools-mcp/cloak-profile`（与默认物理隔离）                                                    |
-| **实际浏览器**                 | 你装的 Google Chrome（带 Web Store、扩展、sync）                                                                | 定制 Chromium 编译版（无 Google 服务、无 Web Store）                                                              |
+| 层                             | 默认模式                                                                                                        | `--cloak` 模式                                                                                                                    |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **协议层**（CDP）              | Patchright：不调 `Runtime.enable` / `Console.enable`，在 isolated world 里执行 evaluate，移除自动化 launch flag | 同                                                                                                                                |
+| **源码层**（C++ 二进制 patch） | 无 —— 直接用系统 Google Chrome                                                                                  | CloakBrowser 二进制（按平台提供源码层指纹 patch，覆盖 `navigator.webdriver`、canvas、WebGL、audio、GPU、字体、屏幕、WebRTC、TLS） |
+| **Profile 目录**               | `~/.cache/chrome-devtools-mcp/chrome-profile`（持久化登录态）                                                   | `~/.cache/chrome-devtools-mcp/cloak-profile`（与默认物理隔离）                                                                    |
+| **实际浏览器**                 | 你装的 Google Chrome（带 Web Store、扩展、sync）                                                                | 定制 Chromium 编译版（无 Google 服务、无 Web Store）                                                                              |
 
 另外几个导航级措施（两种模式都生效）：
 
@@ -128,7 +128,7 @@ npm run build
 
 **何时开 `--cloak`**：只在以上还不够、被站点指纹拦截时才用。详见 [docs/cloak.md](docs/cloak.md)。
 
-## 工具列表（22 个）
+## 工具列表（24 个）
 
 ### 页面与导航
 
@@ -138,6 +138,7 @@ npm run build
 | `new_page`        | 创建新页面并导航到 URL                     |
 | `navigate_page`   | 导航、后退、前进或刷新页面                 |
 | `select_frame`    | 列出所有 frame（iframe），或选择执行上下文 |
+| `click_element`   | 严格匹配并点击当前 frame 中的单个可见元素  |
 | `take_screenshot` | 截取页面截图                               |
 
 ### 脚本分析
@@ -155,10 +156,10 @@ npm run build
 | ------------------------ | ----------------------------------------------- |
 | `set_breakpoint_on_text` | 通过搜索代码文本自动设置断点（适用于压缩代码）  |
 | `break_on_xhr`           | 按 URL 模式设置 XHR/Fetch 断点                  |
-| `remove_breakpoint`      | 按 ID、URL 或全部移除断点，自动恢复执行         |
+| `remove_breakpoint`      | 用显式 action 按 ID、URL 或全部移除断点         |
 | `list_breakpoints`       | 列出所有活动断点                                |
 | `get_paused_info`        | 获取暂停状态、调用栈和作用域变量                |
-| `pause_or_resume`        | 切换暂停/恢复执行                               |
+| `pause_or_resume`        | 用显式 action 暂停或恢复执行                    |
 | `step`                   | 单步调试（over/into/out），返回位置和源码上下文 |
 
 ### 网络与 WebSocket
@@ -166,14 +167,15 @@ npm run build
 | 工具                     | 描述                                                        |
 | ------------------------ | ----------------------------------------------------------- |
 | `list_network_requests`  | 列出网络请求、查看详情，或导出 header/body/query 等原始材料 |
+| `clear_network_requests` | 显式确认后清空当前页面已收集的请求和 body cache             |
 | `get_request_initiator`  | 获取网络请求的 JavaScript 调用栈                            |
 | `get_websocket_messages` | 列出 WebSocket 连接、分析消息模式或获取消息详情             |
 
 ### 浏览器状态
 
-| 工具              | 描述                                                                   |
-| ----------------- | ---------------------------------------------------------------------- |
-| `clear_site_data` | 清理当前站点相关 cookies、HTTP cache、origin storage 和 sessionStorage |
+| 工具              | 描述                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------- |
+| `clear_site_data` | 清理当前站点相关 cookies、origin storage 和 sessionStorage；可显式选择清理全局 HTTP cache |
 
 ### 检查工具
 
@@ -231,7 +233,7 @@ npm run build
 ### Cookie / 风控重放流程
 
 ```
-1. clear_site_data 清理当前站点状态
+1. clear_site_data(confirm=true) 清理当前站点状态
 2. navigate_page(type="reload") 重新触发初始化
 3. list_network_requests 找到设置 cookie 或提交 sensor 的请求
 4. 导出 requestBody / responseHeaders / responseBody
@@ -240,14 +242,15 @@ npm run build
 
 ## 配置选项
 
-CLI 刻意精简到 4 个 flag，全部可选。**99% 场景默认即可**。
+CLI 保持精简，所有 flag 都是可选项。**99% 场景默认即可**。涉及本地文件时，建议用 `--allowedRoots` 限定 Agent 可读写的目录。
 
 | 选项               | 描述                                                                                                                                                                                                                      | 默认值  |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `--cloak`          | 切换到 CloakBrowser 隐身二进制（取代系统 Chrome）。叠加 49 个 C++ 源码层指纹 patch。首次启动自动下载 ~200MB 二进制；指纹身份按 profile 持久化。详见 [docs/cloak.md](docs/cloak.md)。                                      | `false` |
+| `--cloak`          | 切换到 CloakBrowser 隐身二进制（取代系统 Chrome）。启用按平台提供的 C++ 源码层指纹 patch。首次启动自动下载 ~200MB 二进制；指纹身份按 profile 持久化。详见 [docs/cloak.md](docs/cloak.md)。                                | `false` |
 | `--isolated`       | 使用临时 user-data-dir（cookies/localStorage 不保留，关闭时自动清理）                                                                                                                                                     | `false` |
 | `--browserUrl, -u` | 连接到已运行的 Chrome 实例（CDP HTTP 端点，如 `http://127.0.0.1:9222`）。MCP 会自动探测出 WebSocket debugger URL。本地 Chrome、AdsPower、BitBrowser 等怎么拿到这个端点详见 [docs/cdp-endpoint.md](docs/cdp-endpoint.md)。 | –       |
-| `--logFile`        | 调试日志输出文件路径（配合 `DEBUG=*` 环境变量得到详细日志）                                                                                                                                                               | –       |
+| `--logFile`        | 写入 `0600` 普通文件的 MCP 调试日志；详细日志仅使用 `DEBUG=mcp:*`。不要使用 `DEBUG=*`，浏览器协议日志可能泄露页面、Cookie、脚本和凭据。                                                                                   | –       |
+| `--allowedRoots`   | 可重复指定 Agent 允许读写的本地目录；解析真实路径并拒绝符号链接越界。启用时禁用 `file:`、`view-source:file:` 和 `filesystem:file:` 浏览器页面。未指定时本地文件访问不受目录限制，启动时会打印安全警告。                   | –       |
 
 ### 示例配置
 
@@ -352,7 +355,7 @@ CLI 刻意精简到 4 个 flag，全部可选。**99% 场景默认即可**。
    ```json
    "args": ["js-reverse-mcp", "--isolated"]
    ```
-2. **还不行就开 `--cloak`** —— 加 49 个源码层指纹 patch：
+2. **还不行就开 `--cloak`** —— 启用按平台提供的源码层指纹 patch：
    ```json
    "args": ["js-reverse-mcp", "--cloak"]
    ```
@@ -366,6 +369,8 @@ CLI 刻意精简到 4 个 flag，全部可选。**99% 场景默认即可**。
 ## 安全提示
 
 此工具会将浏览器内容暴露给 MCP 客户端，允许检查、调试和修改浏览器中的任何数据。请勿在包含敏感信息的页面上使用。
+
+`evaluate_script.localFilePath`、各类 `outputFile`/`filePath` 会让 MCP 进程读取或写入宿主机文件。生产或共享环境应使用一个或多个 `--allowedRoots` 收窄到专用工作目录；未配置时访问范围不受限制。启用 `--allowedRoots` 后，`file:`、`view-source:file:` 和 `filesystem:file:` 浏览器页面也会被拒绝，避免通过浏览器导航绕过目录边界；需要调试本地页面时，只能在明确接受本地文件暴露风险的会话中不配置该选项。
 
 ## 许可证
 

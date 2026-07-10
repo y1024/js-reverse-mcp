@@ -18,10 +18,41 @@ import * as prettier from 'prettier';
 
 import type {CallFrame, DebuggerContext} from '../DebuggerContext.js';
 import {zod} from '../third_party/index.js';
+import {ToolError} from '../ToolError.js';
+import {paginate} from '../utils/pagination.js';
 
 import {ToolCategory} from './categories.js';
 import type {Response} from './ToolDefinition.js';
-import {defineTool} from './ToolDefinition.js';
+import {
+  createToolOutputSchema,
+  defineTool,
+  PAGINATION_OUTPUT_SCHEMA,
+  paginationSchema,
+} from './ToolDefinition.js';
+
+function requireDebuggerEnabled(debugger_: DebuggerContext): void {
+  if (!debugger_.isEnabled()) {
+    throw new ToolError(
+      'PRECONDITION_FAILED',
+      'Debugger is not enabled. Select a page and retry.',
+    );
+  }
+}
+
+function throwToolFailure(
+  code: 'CDP_ERROR' | 'IO_ERROR',
+  prefix: string,
+  error: unknown,
+): never {
+  if (error instanceof ToolError) {
+    throw error;
+  }
+  throw new ToolError(
+    code,
+    `${prefix}: ${error instanceof Error ? error.message : String(error)}`,
+    {cause: error, retryable: code === 'CDP_ERROR'},
+  );
+}
 
 /**
  * After a step command, append a concise summary of where execution stopped.
@@ -86,12 +117,27 @@ async function appendStepSummary(
 export const listScripts = defineTool({
   name: 'list_scripts',
   description:
-    'Lists all JavaScript scripts loaded in the current page. Returns script ID, URL, and source map information. Use this to find scripts before setting breakpoints or searching. Script IDs are valid for the current page load only; after navigation, call list_scripts again or prefer script URLs for follow-up tools.',
+    'Lists loaded JavaScript scripts, including inline and eval scripts. Returns 20 per page by default with script ID, URL/kind, and source map information. Script IDs are valid only for the current page load.',
   annotations: {
     title: 'List Scripts',
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: true,
   },
+  capabilities: ['debugger'],
+  outputSchema: createToolOutputSchema({
+    scripts: zod
+      .array(
+        zod.object({
+          scriptId: zod.string(),
+          url: zod.string().nullable(),
+          kind: zod.enum(['external', 'inline_or_eval']),
+          sourceMapURL: zod.string().nullable(),
+          hash: zod.string(),
+        }),
+      )
+      .optional(),
+    pagination: PAGINATION_OUTPUT_SCHEMA.optional(),
+  }),
   schema: {
     filter: zod
       .string()
@@ -99,16 +145,12 @@ export const listScripts = defineTool({
       .describe(
         'Optional filter string to match against script URLs (case-insensitive partial match).',
       ),
+    ...paginationSchema,
   },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     let scripts = debugger_.getScripts();
 
@@ -117,17 +159,35 @@ export const listScripts = defineTool({
       scripts = debugger_.getScriptsByUrlPattern(request.params.filter);
     }
 
-    // Filter out scripts without URLs (inline/eval scripts) unless they're the only ones
-    const scriptsWithUrls = scripts.filter(s => s.url);
-    const displayScripts =
-      scriptsWithUrls.length > 0 ? scriptsWithUrls : scripts;
+    const paginated = paginate(scripts, {
+      pageSize: request.params.pageSize,
+      pageIdx: request.params.pageIdx,
+    });
+    if (paginated.invalidPage) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `pageIdx ${request.params.pageIdx} is outside 0-${paginated.totalPages - 1}.`,
+      );
+    }
+    const displayScripts = paginated.items;
+    const pagination = {
+      pageIdx: paginated.currentPage,
+      pageSize: request.params.pageSize ?? 20,
+      totalItems: scripts.length,
+      totalPages: paginated.totalPages,
+      hasNextPage: paginated.hasNextPage,
+      hasPreviousPage: paginated.hasPreviousPage,
+    };
 
     if (displayScripts.length === 0) {
       response.appendResponseLine('No scripts found.');
+      response.setStructuredContent({scripts: [], pagination});
       return;
     }
 
-    response.appendResponseLine(`Found ${displayScripts.length} script(s):\n`);
+    response.appendResponseLine(
+      `Found ${scripts.length} script(s), showing ${paginated.startIndex + 1}-${paginated.endIndex}:\n`,
+    );
 
     for (const script of displayScripts) {
       response.appendResponseLine(`- ID: ${script.scriptId}`);
@@ -143,6 +203,21 @@ export const listScripts = defineTool({
       }
       response.appendResponseLine('');
     }
+    if (paginated.hasNextPage) {
+      response.appendResponseLine(
+        `Next page: pageIdx=${paginated.currentPage + 1}`,
+      );
+    }
+    response.setStructuredContent({
+      scripts: displayScripts.map(script => ({
+        scriptId: script.scriptId,
+        url: script.url || null,
+        kind: script.url ? 'external' : 'inline_or_eval',
+        sourceMapURL: script.sourceMapURL ?? null,
+        hash: script.hash,
+      })),
+      pagination,
+    });
   },
 });
 
@@ -158,6 +233,7 @@ export const getScriptSource = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: true,
   },
+  capabilities: ['debugger'],
   schema: {
     url: zod
       .string()
@@ -200,19 +276,16 @@ export const getScriptSource = defineTool({
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const {url, startLine, endLine, offset, length} = request.params;
     let {scriptId} = request.params;
 
     if (!url && !scriptId) {
-      response.appendResponseLine('Either url or scriptId must be provided.');
-      return;
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        'Either url or scriptId must be provided.',
+      );
     }
 
     try {
@@ -233,8 +306,10 @@ export const getScriptSource = defineTool({
       }
 
       if (!source && !bytecode) {
-        response.appendResponseLine(`No source found for script ${scriptId}.`);
-        return;
+        throw new ToolError(
+          'NOT_FOUND',
+          `No source found for script ${scriptId}.`,
+        );
       }
 
       if (bytecode) {
@@ -242,6 +317,11 @@ export const getScriptSource = defineTool({
         response.appendResponseLine(
           `Script ${scriptId} is a WebAssembly binary file (${binaryData.length} bytes). Please use save_script_source to download it as a .wasm file.`,
         );
+        response.setStructuredContent({
+          scriptId,
+          sourceType: 'wasm',
+          byteLength: binaryData.length,
+        });
         return;
       }
 
@@ -260,6 +340,14 @@ export const getScriptSource = defineTool({
         response.appendResponseLine('```javascript');
         response.appendResponseLine(`${prefix}${extract}${suffix}`);
         response.appendResponseLine('```');
+        response.setStructuredContent({
+          scriptId,
+          sourceType: 'javascript',
+          startOffset: start,
+          endOffset: end,
+          totalChars: source.length,
+          source: extract,
+        });
         return;
       }
 
@@ -300,6 +388,14 @@ export const getScriptSource = defineTool({
           response.appendResponseLine(`${start + i + 1}: ${selectedLines[i]}`);
         }
         response.appendResponseLine('```');
+        response.setStructuredContent({
+          scriptId,
+          sourceType: 'javascript',
+          startLine: start + 1,
+          endLine: Math.min(end, lines.length),
+          totalLines: lines.length,
+          source: selectedLines.join('\n'),
+        });
         return;
       }
 
@@ -318,10 +414,16 @@ export const getScriptSource = defineTool({
         response.appendResponseLine(source);
         response.appendResponseLine('```');
       }
+      response.setStructuredContent({
+        scriptId,
+        sourceType: 'javascript',
+        totalChars: source.length,
+        source:
+          source.length > 1000 ? `${source.substring(0, 1000)}...` : source,
+        truncated: source.length > 1000,
+      });
     } catch (error) {
-      response.appendResponseLine(
-        `Error getting script source: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Failed to get script source', error);
     }
   },
 });
@@ -338,6 +440,7 @@ export const saveScriptSource = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: false,
   },
+  capabilities: ['debugger'],
   schema: {
     url: zod
       .string()
@@ -354,7 +457,13 @@ export const saveScriptSource = defineTool({
     filePath: zod
       .string()
       .describe(
-        'Local file path to save the script source to. Absolute paths and paths relative to the current working directory are supported. Use a .js/.mjs/.cjs/.jsx/.ts/.tsx extension to enable auto-format (prettier beautify); other extensions save raw source verbatim. For WASM scripts, use a .wasm extension.',
+        'Local file path to save the script source to. Absolute paths and paths relative to the current working directory are supported. Use a .js/.mjs/.cjs/.jsx/.ts/.tsx extension to enable auto-format (prettier beautify); other extensions save raw source verbatim. For WASM scripts, use a .wasm extension. Subject to --allowedRoots when configured.',
+      ),
+    confirmOverwrite: zod
+      .boolean()
+      .default(false)
+      .describe(
+        'Must be true when filePath already exists. New files do not require confirmation.',
       ),
     format: zod
       .boolean()
@@ -367,18 +476,15 @@ export const saveScriptSource = defineTool({
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const {url, scriptId, filePath, format} = request.params;
 
     if (!url && !scriptId) {
-      response.appendResponseLine('Either url or scriptId must be provided.');
-      return;
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        'Either url or scriptId must be provided.',
+      );
     }
 
     try {
@@ -400,18 +506,26 @@ export const saveScriptSource = defineTool({
       }
 
       if (!source && !bytecode) {
-        response.appendResponseLine(
+        throw new ToolError(
+          'NOT_FOUND',
           `No source found for script ${resolvedId}.`,
         );
-        return;
       }
 
       if (bytecode) {
         const binaryData = Buffer.from(bytecode, 'base64');
-        const result = await context.saveFile(binaryData, filePath);
+        const result = await context.saveFile(binaryData, filePath, {
+          confirmOverwrite: request.params.confirmOverwrite,
+        });
         response.appendResponseLine(
           `Saved WASM script source to ${result.filename} (${binaryData.length} bytes).`,
         );
+        response.setStructuredContent({
+          scriptId: resolvedId,
+          filename: result.filename,
+          byteLength: binaryData.length,
+          sourceType: 'wasm',
+        });
       } else {
         let output = source;
         let formatNote = '';
@@ -429,15 +543,21 @@ export const saveScriptSource = defineTool({
           }
         }
         const data = new TextEncoder().encode(output);
-        const result = await context.saveFile(data, filePath);
+        const result = await context.saveFile(data, filePath, {
+          confirmOverwrite: request.params.confirmOverwrite,
+        });
         response.appendResponseLine(
           `Saved script source to ${result.filename} (${output.length} chars${formatNote}).`,
         );
+        response.setStructuredContent({
+          scriptId: resolvedId,
+          filename: result.filename,
+          charLength: output.length,
+          formatted: formatNote === ' (formatted)',
+        });
       }
     } catch (error) {
-      response.appendResponseLine(
-        `Error saving script source: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('IO_ERROR', 'Failed to save script source', error);
     }
   },
 });
@@ -448,12 +568,29 @@ export const saveScriptSource = defineTool({
 export const searchInSources = defineTool({
   name: 'search_in_sources',
   description:
-    'Searches for a string or regex pattern in all loaded JavaScript sources. Returns matching lines with script ID, URL, and line number. Use get_script_source with startLine/endLine to view full context around matches.',
+    'Searches all loaded JavaScript sources, including inline/eval and compressed bundles by default. Returns matching lines with script ID, URL/kind, and line number. Use get_script_source for surrounding context.',
   annotations: {
     title: 'Search in Sources',
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: true,
   },
+  capabilities: ['debugger'],
+  outputSchema: createToolOutputSchema({
+    query: zod.string().optional(),
+    totalMatches: zod.number().int().optional(),
+    skippedMinified: zod.number().int().optional(),
+    matches: zod
+      .array(
+        zod.object({
+          scriptId: zod.string(),
+          url: zod.string().nullable(),
+          kind: zod.enum(['external', 'inline_or_eval']),
+          lineNumber: zod.number().int(),
+          lineContent: zod.string(),
+        }),
+      )
+      .optional(),
+  }),
   schema: {
     query: zod.string().describe('The search query (string or regex pattern).'),
     caseSensitive: zod
@@ -483,9 +620,9 @@ export const searchInSources = defineTool({
     excludeMinified: zod
       .boolean()
       .optional()
-      .default(true)
+      .default(false)
       .describe(
-        'Skip minified files (files with very long lines). Default: true.',
+        'Skip minified files (files with very long lines). Default: false so compressed bundles are searched automatically.',
       ),
     urlFilter: zod
       .string()
@@ -497,12 +634,7 @@ export const searchInSources = defineTool({
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const {
       query,
@@ -522,6 +654,7 @@ export const searchInSources = defineTool({
 
       if (result.matches.length === 0) {
         response.appendResponseLine(`No matches found for "${query}".`);
+        response.setStructuredContent({query, totalMatches: 0, matches: []});
         return;
       }
 
@@ -557,11 +690,24 @@ export const searchInSources = defineTool({
             `(${skippedMinified} matches in minified files were skipped. Set excludeMinified=false to include them.)`,
           );
         }
+        response.setStructuredContent({
+          query,
+          totalMatches: 0,
+          skippedMinified,
+          matches: [],
+        });
         return;
       }
 
       const displayMatches = filteredMatches.slice(0, maxResults);
       const totalMatches = filteredMatches.length;
+      const structuredMatches: Array<{
+        scriptId: string;
+        url: string | null;
+        kind: 'external' | 'inline_or_eval';
+        lineNumber: number;
+        lineContent: string;
+      }> = [];
 
       response.appendResponseLine(
         `Found ${totalMatches} match(es) for "${query}"${totalMatches > maxResults ? ` (showing first ${maxResults})` : ''}:`,
@@ -610,16 +756,27 @@ export const searchInSources = defineTool({
         response.appendResponseLine(`[${scriptId}] ${url}:${lineNum}`);
         response.appendResponseLine(`  ${preview}`);
         response.appendResponseLine('');
+        structuredMatches.push({
+          scriptId,
+          url: match.url || null,
+          kind: match.url ? 'external' : 'inline_or_eval',
+          lineNumber: lineNum,
+          lineContent: preview,
+        });
       }
 
       response.appendResponseLine('---');
       response.appendResponseLine(
         'Tip: Use get_script_source(url=..., startLine, endLine) to view full context around a match. Using url is preferred over scriptId as it stays valid across page navigations.',
       );
+      response.setStructuredContent({
+        query,
+        totalMatches,
+        skippedMinified,
+        matches: structuredMatches,
+      });
     } catch (error) {
-      response.appendResponseLine(
-        `Error searching: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Source search failed', error);
     }
   },
 });
@@ -631,13 +788,19 @@ export const searchInSources = defineTool({
 export const removeBreakpoint = defineTool({
   name: 'remove_breakpoint',
   description:
-    'Removes breakpoints. Pass breakpointId to remove a code breakpoint, url to remove an XHR breakpoint, or neither to remove ALL breakpoints (code + XHR).',
+    'Removes breakpoints using an explicit action. Use remove_code with breakpointId, remove_xhr with url, or remove_all with confirm=true.',
   annotations: {
     title: 'Remove Breakpoint',
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
   },
+  capabilities: ['debugger'],
   schema: {
+    action: zod
+      .enum(['remove_code', 'remove_xhr', 'remove_all'])
+      .describe('Explicit breakpoint removal action.'),
     breakpointId: zod
       .string()
       .optional()
@@ -648,54 +811,96 @@ export const removeBreakpoint = defineTool({
       .string()
       .optional()
       .describe('The XHR breakpoint URL pattern to remove.'),
+    confirm: zod
+      .boolean()
+      .default(false)
+      .describe('Must be true for any breakpoint removal action.'),
   },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
+    requireDebuggerEnabled(debugger_);
+
+    const {action, breakpointId, url, confirm} = request.params;
+
+    if (!confirm) {
+      throw new ToolError(
+        'CONFIRMATION_REQUIRED',
+        'remove_breakpoint requires confirm=true.',
       );
-      return;
     }
 
-    const {breakpointId, url} = request.params;
-
     try {
-      if (breakpointId) {
+      if (action === 'remove_code') {
+        if (!breakpointId) {
+          throw new ToolError(
+            'INVALID_ARGUMENT',
+            'action=remove_code requires breakpointId.',
+          );
+        }
         // Remove a single code breakpoint by ID
         await debugger_.removeBreakpoint(breakpointId);
         response.appendResponseLine(`Breakpoint ${breakpointId} removed.`);
-      } else if (url) {
+        response.setStructuredContent({
+          action,
+          removed: {kind: 'code', breakpointId},
+        });
+      } else if (action === 'remove_xhr') {
+        if (!url) {
+          throw new ToolError(
+            'INVALID_ARGUMENT',
+            'action=remove_xhr requires url.',
+          );
+        }
         // Remove a single XHR breakpoint by URL
         await debugger_.removeXHRBreakpoint(url);
         response.appendResponseLine(`XHR breakpoint for "${url}" removed.`);
+        response.setStructuredContent({
+          action,
+          removed: {kind: 'xhr', url},
+        });
       } else {
         // Remove all breakpoints (code + XHR)
         const codeCount = debugger_.getBreakpoints().length;
         const xhrCount = debugger_.getXHRBreakpoints().length;
         if (codeCount === 0 && xhrCount === 0) {
           response.appendResponseLine('No active breakpoints to remove.');
+          response.setStructuredContent({
+            action,
+            removed: {codeCount: 0, xhrCount: 0},
+          });
           return;
         }
-        await debugger_.removeAllBreakpoints();
+        const result = await debugger_.removeAllBreakpoints();
+        if (result.failedCode.length || result.failedXHR.length) {
+          throw new ToolError(
+            'CDP_ERROR',
+            `Breakpoint removal was partial: removed ${result.removedCode} code and ${result.removedXHR} XHR; failed ${result.failedCode.length} code and ${result.failedXHR.length} XHR. List breakpoints to inspect what remains.`,
+            {retryable: true},
+          );
+        }
         const parts: string[] = [];
-        if (codeCount > 0) parts.push(`${codeCount} code`);
-        if (xhrCount > 0) parts.push(`${xhrCount} XHR`);
+        if (result.removedCode > 0) parts.push(`${result.removedCode} code`);
+        if (result.removedXHR > 0) parts.push(`${result.removedXHR} XHR`);
         response.appendResponseLine(
           `Removed ${parts.join(' + ')} breakpoint(s).`,
         );
+        response.setStructuredContent({
+          action,
+          removed: {
+            codeCount: result.removedCode,
+            xhrCount: result.removedXHR,
+          },
+        });
       }
 
       if (debugger_.isPaused()) {
         response.appendResponseLine(
-          'Execution is still paused. Use pause_or_resume when you are ready to continue.',
+          'Execution is still paused. Use pause_or_resume(action="resume") when you are ready to continue.',
         );
       }
     } catch (error) {
-      response.appendResponseLine(
-        `Error: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Breakpoint removal failed', error);
     }
   },
 });
@@ -706,28 +911,55 @@ export const removeBreakpoint = defineTool({
 export const listBreakpoints = defineTool({
   name: 'list_breakpoints',
   description:
-    'Lists active code breakpoints and XHR/Fetch URL breakpoints in the current debugging session. Breakpoints are tracked by this MCP session and restored after reload/goto/back/forward when possible.',
+    'Lists active code and XHR/Fetch breakpoints, 20 per page by default. Breakpoints are tracked by this MCP session and restored after navigation when possible.',
   annotations: {
     title: 'List Breakpoints',
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: true,
   },
-  schema: {},
+  capabilities: ['debugger'],
+  outputSchema: createToolOutputSchema({
+    breakpoints: zod.array(zod.record(zod.string(), zod.unknown())).optional(),
+    pagination: PAGINATION_OUTPUT_SCHEMA.optional(),
+  }),
+  schema: paginationSchema,
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const breakpoints = debugger_.getBreakpoints();
     const xhrBreakpoints = debugger_.getXHRBreakpoints();
+    const entries = [
+      ...breakpoints.map(breakpoint => ({
+        kind: 'code' as const,
+        breakpoint,
+      })),
+      ...xhrBreakpoints.map(url => ({kind: 'xhr' as const, url})),
+    ];
+
+    const paginated = paginate(entries, {
+      pageSize: request.params.pageSize,
+      pageIdx: request.params.pageIdx,
+    });
+    if (paginated.invalidPage) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `pageIdx ${request.params.pageIdx} is outside 0-${paginated.totalPages - 1}.`,
+      );
+    }
+    const pagination = {
+      pageIdx: paginated.currentPage,
+      pageSize: request.params.pageSize ?? 20,
+      totalItems: entries.length,
+      totalPages: paginated.totalPages,
+      hasNextPage: paginated.hasNextPage,
+      hasPreviousPage: paginated.hasPreviousPage,
+    };
 
     if (breakpoints.length === 0 && xhrBreakpoints.length === 0) {
       response.appendResponseLine('No active breakpoints.');
+      response.setStructuredContent({breakpoints: [], pagination});
       return;
     }
 
@@ -735,9 +967,12 @@ export const listBreakpoints = defineTool({
       `Active breakpoints (${breakpoints.length} code, ${xhrBreakpoints.length} XHR/Fetch):\n`,
     );
 
-    if (breakpoints.length > 0) {
-      response.appendResponseLine('Code breakpoints:');
-      for (const bp of breakpoints) {
+    response.appendResponseLine(
+      `Showing ${paginated.startIndex + 1}-${paginated.endIndex} of ${entries.length}.`,
+    );
+    for (const entry of paginated.items) {
+      if (entry.kind === 'code') {
+        const bp = entry.breakpoint;
         response.appendResponseLine(`- ID: ${bp.breakpointId}`);
         response.appendResponseLine(`  URL: ${bp.url}`);
         response.appendResponseLine(
@@ -750,15 +985,30 @@ export const listBreakpoints = defineTool({
           response.appendResponseLine(`  Locations: ${bp.locations.length}`);
         }
         response.appendResponseLine('');
+      } else {
+        response.appendResponseLine(`- XHR URL contains: ${entry.url}`);
       }
     }
-
-    if (xhrBreakpoints.length > 0) {
-      response.appendResponseLine('XHR/Fetch breakpoints:');
-      for (const url of xhrBreakpoints) {
-        response.appendResponseLine(`- URL contains: ${url}`);
-      }
+    if (paginated.hasNextPage) {
+      response.appendResponseLine(
+        `Next page: pageIdx=${paginated.currentPage + 1}`,
+      );
     }
+    response.setStructuredContent({
+      breakpoints: paginated.items.map(entry =>
+        entry.kind === 'code'
+          ? {
+              kind: 'code',
+              breakpointId: entry.breakpoint.breakpointId,
+              url: entry.breakpoint.url,
+              lineNumber: entry.breakpoint.lineNumber + 1,
+              columnNumber: entry.breakpoint.columnNumber,
+              condition: entry.breakpoint.condition ?? null,
+            }
+          : {kind: 'xhr', url: entry.url},
+      ),
+      pagination,
+    });
   },
 });
 
@@ -774,6 +1024,7 @@ export const getRequestInitiator = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: true,
   },
+  capabilities: ['network'],
   schema: {
     requestId: zod
       .number()
@@ -786,7 +1037,16 @@ export const getRequestInitiator = defineTool({
     const {requestId} = request.params;
 
     try {
-      const httpRequest = context.getNetworkRequestById(requestId);
+      let httpRequest: ReturnType<typeof context.getNetworkRequestById>;
+      try {
+        httpRequest = context.getNetworkRequestById(requestId);
+      } catch (error) {
+        throw new ToolError(
+          'NOT_FOUND',
+          `Network request ${requestId} is no longer retained. List network requests and use a current reqid.`,
+          {cause: error},
+        );
+      }
       const initiator = context.getRequestInitiator(httpRequest);
 
       if (!initiator) {
@@ -796,6 +1056,7 @@ export const getRequestInitiator = defineTool({
         response.appendResponseLine(
           'This might be a navigation request or the initiator was not captured.',
         );
+        response.setStructuredContent({requestId, initiator: null});
         return;
       }
 
@@ -845,10 +1106,13 @@ export const getRequestInitiator = defineTool({
           }
         }
       }
+      response.setStructuredContent({
+        requestId,
+        requestUrl: httpRequest.url(),
+        initiator,
+      });
     } catch (error) {
-      response.appendResponseLine(
-        `Error getting initiator: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Failed to get request initiator', error);
     }
   },
 });
@@ -865,6 +1129,13 @@ export const getPausedInfo = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: true,
   },
+  capabilities: ['debugger'],
+  outputSchema: createToolOutputSchema({
+    paused: zod.boolean().optional(),
+    reason: zod.string().nullable().optional(),
+    hitBreakpoints: zod.array(zod.string()).optional(),
+    callFrames: zod.array(zod.record(zod.string(), zod.unknown())).optional(),
+  }),
   schema: {
     includeScopes: zod
       .boolean()
@@ -895,21 +1166,15 @@ export const getPausedInfo = defineTool({
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const pausedState = debugger_.getPausedState();
 
     if (!pausedState.isPaused) {
-      response.appendResponseLine('Execution is not paused.');
-      response.appendResponseLine(
-        'Set a breakpoint and trigger it to pause execution.',
+      throw new ToolError(
+        'PRECONDITION_FAILED',
+        'Execution is not paused. Set a breakpoint and trigger it first.',
       );
-      return;
     }
 
     response.appendResponseLine('🔴 Execution Paused\n');
@@ -941,8 +1206,9 @@ export const getPausedInfo = defineTool({
     if (request.params.includeScopes && pausedState.callFrames.length > 0) {
       const frameIndex = request.params.frameIndex;
       if (frameIndex < 0 || frameIndex >= pausedState.callFrames.length) {
-        response.appendResponseLine(
-          `\n⚠️ frameIndex ${frameIndex} is out of range (0-${pausedState.callFrames.length - 1}).`,
+        throw new ToolError(
+          'INVALID_ARGUMENT',
+          `frameIndex ${frameIndex} is out of range (0-${pausedState.callFrames.length - 1}).`,
         );
       } else {
         const selectedFrame = pausedState.callFrames[frameIndex];
@@ -1015,8 +1281,20 @@ export const getPausedInfo = defineTool({
     }
 
     response.appendResponseLine(
-      '\n💡 Use pause_or_resume to resume, or step with direction="over" | "into" | "out" to continue one step.',
+      '\n💡 Use pause_or_resume(action="resume") to resume, or step with direction="over" | "into" | "out" to continue one step.',
     );
+    response.setStructuredContent({
+      paused: true,
+      reason: pausedState.reason ?? null,
+      hitBreakpoints: pausedState.hitBreakpoints ?? [],
+      callFrames: pausedState.callFrames.map((frame, index) => ({
+        frameIndex: index,
+        callFrameId: frame.callFrameId,
+        functionName: frame.functionName,
+        url: frame.url,
+        location: frame.location,
+      })),
+    });
   },
 });
 
@@ -1026,37 +1304,52 @@ export const getPausedInfo = defineTool({
 export const pauseOrResume = defineTool({
   name: 'pause_or_resume',
   description:
-    'Toggles JavaScript execution. If paused, resumes execution. If running, requests a pause at the next JavaScript statement.',
+    'Explicitly pauses or resumes JavaScript execution. Pass action="pause" or action="resume"; the tool never toggles implicitly.',
   annotations: {
     title: 'Pause / Resume',
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: false,
   },
-  schema: {},
+  capabilities: ['debugger'],
+  schema: {
+    action: zod
+      .enum(['pause', 'resume'])
+      .describe('Explicit execution action: pause or resume.'),
+  },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     try {
-      if (debugger_.isPaused()) {
+      if (request.params.action === 'resume') {
+        if (!debugger_.isPaused()) {
+          throw new ToolError(
+            'CONFLICT',
+            'Execution is already running; action=resume is not applicable.',
+          );
+        }
         await debugger_.resume();
         response.appendResponseLine('▶️ Execution resumed.');
+        response.setStructuredContent({action: 'resume', state: 'running'});
       } else {
+        if (debugger_.isPaused()) {
+          throw new ToolError(
+            'CONFLICT',
+            'Execution is already paused; action=pause is not applicable.',
+          );
+        }
         await debugger_.pause();
         response.appendResponseLine(
           '⏸️ Pause requested. Waiting for execution to pause...',
         );
+        response.setStructuredContent({
+          action: 'pause',
+          state: 'pause_requested',
+        });
       }
     } catch (error) {
-      response.appendResponseLine(
-        `Error: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Execution action failed', error);
     }
   },
 });
@@ -1073,6 +1366,7 @@ export const step = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: false,
   },
+  capabilities: ['debugger'],
   schema: {
     direction: zod
       .enum(['over', 'into', 'out'])
@@ -1083,16 +1377,13 @@ export const step = defineTool({
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     if (!debugger_.isPaused()) {
-      response.appendResponseLine('Execution is not paused. Cannot step.');
-      return;
+      throw new ToolError(
+        'PRECONDITION_FAILED',
+        'Execution is not paused. Cannot step.',
+      );
     }
 
     const {direction} = request.params;
@@ -1110,10 +1401,17 @@ export const step = defineTool({
             ? await debugger_.stepInto()
             : await debugger_.stepOut();
       await appendStepSummary(response, debugger_, labels[direction], frame);
+      response.setStructuredContent({
+        direction,
+        callFrame: {
+          callFrameId: frame.callFrameId,
+          functionName: frame.functionName,
+          url: frame.url,
+          location: frame.location,
+        },
+      });
     } catch (error) {
-      response.appendResponseLine(
-        `Error stepping ${direction}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', `Failed to step ${direction}`, error);
     }
   },
 });
@@ -1131,6 +1429,7 @@ export const setBreakpointOnText = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: false,
   },
+  capabilities: ['debugger'],
   schema: {
     text: zod
       .string()
@@ -1146,6 +1445,7 @@ export const setBreakpointOnText = defineTool({
     occurrence: zod
       .number()
       .int()
+      .positive()
       .optional()
       .default(1)
       .describe('Which occurrence to break on (1 = first, 2 = second, etc.).'),
@@ -1159,12 +1459,7 @@ export const setBreakpointOnText = defineTool({
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const {text, urlFilter, occurrence, condition} = request.params;
 
@@ -1176,10 +1471,10 @@ export const setBreakpointOnText = defineTool({
       });
 
       if (searchResult.matches.length === 0) {
-        response.appendResponseLine(
-          `"${text}" not found in any loaded script.`,
+        throw new ToolError(
+          'NOT_FOUND',
+          `"${text}" was not found in any loaded script.`,
         );
-        return;
       }
 
       // Apply URL filter if specified
@@ -1190,19 +1485,19 @@ export const setBreakpointOnText = defineTool({
           m => m.url && m.url.toLowerCase().includes(lowerFilter),
         );
         if (matches.length === 0) {
-          response.appendResponseLine(
-            `"${text}" not found in scripts matching "${urlFilter}".`,
+          throw new ToolError(
+            'NOT_FOUND',
+            `"${text}" was not found in scripts matching "${urlFilter}".`,
           );
-          return;
         }
       }
 
       // Get the specified occurrence
       if (occurrence > matches.length) {
-        response.appendResponseLine(
+        throw new ToolError(
+          'INVALID_ARGUMENT',
           `Only ${matches.length} occurrence(s) found, but occurrence ${occurrence} was requested.`,
         );
-        return;
       }
 
       const match = matches[occurrence - 1];
@@ -1210,10 +1505,10 @@ export const setBreakpointOnText = defineTool({
       const url = script?.url || match.url;
 
       if (!url) {
-        response.appendResponseLine(
+        throw new ToolError(
+          'PRECONDITION_FAILED',
           'Cannot set breakpoint: script has no URL (inline script).',
         );
-        return;
       }
 
       // Step 2: Get exact column position by searching in the script source
@@ -1267,10 +1562,15 @@ export const setBreakpointOnText = defineTool({
       response.appendResponseLine('```javascript');
       response.appendResponseLine(`${prefix}${preview}${suffix}`);
       response.appendResponseLine('```');
+      response.setStructuredContent({
+        breakpointId: breakpointInfo.breakpointId,
+        url,
+        lineNumber: match.lineNumber + 1,
+        columnNumber,
+        condition: condition ?? null,
+      });
     } catch (error) {
-      response.appendResponseLine(
-        `Error: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Failed to set breakpoint', error);
     }
   },
 });
@@ -1287,25 +1587,23 @@ export const breakOnXhr = defineTool({
     category: ToolCategory.REVERSE_ENGINEERING,
     readOnlyHint: false,
   },
+  capabilities: ['debugger'],
   schema: {
     url: zod.string().describe('URL pattern to break on (partial match).'),
   },
   handler: async (request, response, context) => {
     const debugger_ = context.debuggerContext;
 
-    if (!debugger_.isEnabled()) {
-      response.appendResponseLine(
-        'Debugger is not enabled. Please select a page first.',
-      );
-      return;
-    }
+    requireDebuggerEnabled(debugger_);
 
     const {url} = request.params;
     const client = debugger_.getClient();
 
     if (!client) {
-      response.appendResponseLine('Debugger client not available.');
-      return;
+      throw new ToolError(
+        'PRECONDITION_FAILED',
+        'Debugger client not available.',
+      );
     }
 
     try {
@@ -1316,10 +1614,9 @@ export const breakOnXhr = defineTool({
       response.appendResponseLine(
         'Debugger will pause when a matching XHR/Fetch request is made.',
       );
+      response.setStructuredContent({kind: 'xhr', urlPattern: url});
     } catch (error) {
-      response.appendResponseLine(
-        `Error: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      throwToolFailure('CDP_ERROR', 'Failed to set XHR breakpoint', error);
     }
   },
 });

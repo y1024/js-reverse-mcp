@@ -4,11 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {features} from '../features.js';
 import {zod} from '../third_party/index.js';
 
 import {ToolCategory} from './categories.js';
-import {defineTool} from './ToolDefinition.js';
+import {
+  createToolOutputSchema,
+  defineTool,
+  PAGINATION_OUTPUT_SCHEMA,
+} from './ToolDefinition.js';
 // Playwright's ConsoleMessage.type() returns a string union directly
 type ConsoleResponseType = string;
 
@@ -35,21 +38,21 @@ const FILTERABLE_MESSAGE_TYPES: [
   'count',
   'timeEnd',
   'verbose',
-  'issue',
 ];
-
-if (features.issues) {
-  FILTERABLE_MESSAGE_TYPES.push('issue');
-}
 
 export const listConsoleMessages = defineTool({
   name: 'list_console_messages',
   description:
-    'List all console messages for the currently selected page since the last navigation. Pass msgid to get a single message by its ID.',
+    'List console messages for the selected page, 20 per page by default. Pass msgid to get one message by stable ID.',
   annotations: {
     category: ToolCategory.DEBUGGING,
     readOnlyHint: true,
   },
+  outputSchema: createToolOutputSchema({
+    messages: zod.array(zod.record(zod.string(), zod.unknown())).optional(),
+    message: zod.record(zod.string(), zod.unknown()).optional(),
+    pagination: PAGINATION_OUTPUT_SCHEMA.optional(),
+  }),
   schema: {
     msgid: zod
       .number()
@@ -62,9 +65,7 @@ export const listConsoleMessages = defineTool({
       .int()
       .positive()
       .optional()
-      .describe(
-        'Maximum number of messages to return. When omitted, returns all messages.',
-      ),
+      .describe('Maximum number of messages to return. Defaults to 20.'),
     pageIdx: zod
       .number()
       .int()

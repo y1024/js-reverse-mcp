@@ -167,13 +167,15 @@ clear_site_data
 ```
 
 The tool should create a clean replay environment for the currently selected
-page. It is intentionally zero-parameter: calling it means "clear the browser
-state that would otherwise pollute the next replay."
+page. Browser-wide HTTP cache clearing is an explicit opt-in because it affects
+unrelated pages and origins.
 
 Schema:
 
 ```ts
 {
+  confirm?: boolean // must be true to execute destructive cleanup
+  clearBrowserCache?: boolean // default false; browser-wide effect
 }
 ```
 
@@ -182,7 +184,8 @@ Behavior:
 - Clear cookies that affect the selected page's HTTP(S) frame URLs, including
   `HttpOnly` cookies. This mirrors the DevTools Application panel concept of
   cookies used by the current page's frames.
-- Clear browser HTTP cache.
+- Preserve browser HTTP cache by default. Clear it only when
+  `clearBrowserCache: true` is explicitly requested.
 - Clear all persistent storage for the selected page's HTTP(S) frame origins
   through CDP
   `Storage.clearDataForOrigin` with `storageTypes: "all"`. This covers
@@ -272,7 +275,7 @@ site state.
 1. Add complete response header rendering to request detail view.
 2. Add the dedicated `Set-Cookie` section to request detail view.
 3. Add `[set-cookie]` markers to request list output.
-4. Add zero-parameter `clear_site_data` with strong cleanup behavior.
+4. Add `clear_site_data` with scoped defaults and explicit global-cache opt-in.
 5. Update generated tool documentation.
 6. Run validation.
 
@@ -297,7 +300,8 @@ Network inspection:
 
 Site state reset:
 
-- `clear_site_data` has no parameters.
+- `clear_site_data` requires `confirm=true` to execute and accepts optional
+  `clearBrowserCache`, defaulting to false.
 - `clear_site_data` clears cookies that affect the selected page's HTTP(S)
   frame URLs, including `HttpOnly` cookies.
 - `clear_site_data` reports matched, cleared, and failed cookie names without
@@ -305,7 +309,8 @@ Site state reset:
 - `clear_site_data` does not clear unrelated cookie scopes. Other pages can only
   lose cookie-based login state when they share the same cookie domain/path scope
   as the selected page's frames.
-- `clear_site_data` clears browser HTTP cache.
+- `clear_site_data` preserves browser HTTP cache by default and clears it only
+  when the caller explicitly opts into the browser-wide effect.
 - `clear_site_data` clears all persistent storage for the selected page's
   HTTP(S) frame origins.
 - `clear_site_data` clears sessionStorage in selected-page HTTP(S) frames.

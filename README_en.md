@@ -113,12 +113,12 @@ Several design choices show up throughout the codebase:
 
 Anti-detection is one of js-reverse-mcp's supporting capabilities. The wrapper itself injects **zero** JavaScript and runs no `Object.defineProperty` hacks — those would themselves become detectable. All anti-detection happens in two well-separated layers:
 
-| Layer                                 | Default mode                                                                                                      | `--cloak` mode                                                                                                     |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **Protocol layer** (CDP)              | Patchright: skips `Runtime.enable`/`Console.enable`, evaluates in isolated worlds, strips automation launch flags | Same                                                                                                               |
-| **Source layer** (C++ binary patches) | None — uses system Google Chrome as-is                                                                            | CloakBrowser binary (49 C++ patches: `navigator.webdriver`, canvas, WebGL, audio, GPU, fonts, screen, WebRTC, TLS) |
-| **Profile directory**                 | `~/.cache/chrome-devtools-mcp/chrome-profile` (persistent login)                                                  | `~/.cache/chrome-devtools-mcp/cloak-profile` (physically isolated from the default)                                |
-| **Browser used**                      | Your installed Google Chrome (with Web Store, extensions, sync)                                                   | Custom Chromium build (no Google services, no Web Store)                                                           |
+| Layer                                 | Default mode                                                                                                      | `--cloak` mode                                                                                                                                 |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Protocol layer** (CDP)              | Patchright: skips `Runtime.enable`/`Console.enable`, evaluates in isolated worlds, strips automation launch flags | Same                                                                                                                                           |
+| **Source layer** (C++ binary patches) | None — uses system Google Chrome as-is                                                                            | CloakBrowser binary with platform-specific source patches for `navigator.webdriver`, canvas, WebGL, audio, GPU, fonts, screen, WebRTC, and TLS |
+| **Profile directory**                 | `~/.cache/chrome-devtools-mcp/chrome-profile` (persistent login)                                                  | `~/.cache/chrome-devtools-mcp/cloak-profile` (physically isolated from the default)                                                            |
+| **Browser used**                      | Your installed Google Chrome (with Web Store, extensions, sync)                                                   | Custom Chromium build (no Google services, no Web Store)                                                                                       |
 
 Other navigation-level safeguards (both modes):
 
@@ -128,7 +128,7 @@ Other navigation-level safeguards (both modes):
 
 When to enable `--cloak`: only for sites that block you on fingerprint despite all of the above. See [docs/cloak.en.md](docs/cloak.en.md) for the full guide and tradeoffs.
 
-## Tools (22)
+## Tools (24)
 
 ### Page & Navigation
 
@@ -138,6 +138,7 @@ When to enable `--cloak`: only for sites that block you on fingerprint despite a
 | `new_page`        | Create a new page and navigate to URL                         |
 | `navigate_page`   | Navigate, go back, forward, or reload                         |
 | `select_frame`    | List all frames (iframes), or select one as execution context |
+| `click_element`   | Strictly resolve and click one visible element                |
 | `take_screenshot` | Take a page screenshot                                        |
 
 ### Script Analysis
@@ -155,25 +156,26 @@ When to enable `--cloak`: only for sites that block you on fingerprint despite a
 | ------------------------ | ---------------------------------------------------------------- |
 | `set_breakpoint_on_text` | Set breakpoint by searching code text (works with minified code) |
 | `break_on_xhr`           | Set XHR/Fetch breakpoint by URL pattern                          |
-| `remove_breakpoint`      | Remove breakpoint(s) by ID, URL, or all; auto-resumes            |
+| `remove_breakpoint`      | Remove breakpoint(s) with an explicit action and confirmation    |
 | `list_breakpoints`       | List all active breakpoints                                      |
 | `get_paused_info`        | Get paused state, call stack and scope variables                 |
-| `pause_or_resume`        | Toggle pause/resume execution                                    |
+| `pause_or_resume`        | Explicitly pause or resume execution                             |
 | `step`                   | Step over, into, or out with source context in response          |
 
 ### Network & WebSocket
 
-| Tool                     | Description                                                                   |
-| ------------------------ | ----------------------------------------------------------------------------- |
-| `list_network_requests`  | List requests, inspect one request, or export raw headers/body/query material |
-| `get_request_initiator`  | Get JavaScript call stack for a network request                               |
-| `get_websocket_messages` | List WebSocket connections, analyze messages, or get message details          |
+| Tool                     | Description                                                                    |
+| ------------------------ | ------------------------------------------------------------------------------ |
+| `list_network_requests`  | List requests, inspect one request, or export raw headers/body/query material  |
+| `clear_network_requests` | Clear the selected page's collected requests and body cache after confirmation |
+| `get_request_initiator`  | Get JavaScript call stack for a network request                                |
+| `get_websocket_messages` | List WebSocket connections, analyze messages, or get message details           |
 
 ### Browser State
 
-| Tool              | Description                                                                |
-| ----------------- | -------------------------------------------------------------------------- |
-| `clear_site_data` | Clear current-site cookies, HTTP cache, origin storage, and sessionStorage |
+| Tool              | Description                                                                                            |
+| ----------------- | ------------------------------------------------------------------------------------------------------ |
+| `clear_site_data` | Clear current-site cookies, origin storage, and sessionStorage; optionally clear the global HTTP cache |
 
 ### Inspection
 
@@ -231,7 +233,7 @@ Navigation intentionally stays CDP-silent during the first page load. The recomm
 ### Cookie / Risk-Control Replay Flow
 
 ```
-1. Run clear_site_data to reset current-site state
+1. Run clear_site_data(confirm=true) to reset current-site state
 2. Reload with navigate_page(type="reload")
 3. Use list_network_requests to find cookie-setting or sensor-submitting requests
 4. Export requestBody / responseHeaders / responseBody
@@ -240,14 +242,15 @@ Navigation intentionally stays CDP-silent during the first page load. The recomm
 
 ## Configuration Options
 
-The CLI is intentionally minimal — four flags, all optional. Default behavior is what you want 99% of the time.
+The CLI stays intentionally small and every flag is optional. Default behavior is what you want 99% of the time. When local files are involved, use `--allowedRoots` to restrict which directories the Agent may read and write.
 
-| Option             | Description                                                                                                                                                                                                                                                                           | Default |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `--cloak`          | Use CloakBrowser stealth-patched Chromium binary instead of system Chrome. Adds 49 source-level C++ fingerprint patches. Binary auto-downloads (~200MB) on first use. Identity is persisted per profile. See [docs/cloak.en.md](docs/cloak.en.md).                                    | `false` |
-| `--isolated`       | Use a temporary user data directory (cookies/localStorage not persisted, auto-cleaned on close)                                                                                                                                                                                       | `false` |
-| `--browserUrl, -u` | Connect to a running Chrome instance via CDP HTTP endpoint (e.g. `http://127.0.0.1:9222`). The MCP probes it to find the WebSocket debugger URL. See [docs/cdp-endpoint.en.md](docs/cdp-endpoint.en.md) for how to obtain this endpoint from local Chrome, AdsPower, BitBrowser, etc. | –       |
-| `--logFile`        | Path to write debug logs (also set env `DEBUG=*` for verbose logs)                                                                                                                                                                                                                    | –       |
+| Option             | Description                                                                                                                                                                                                                                                                                           | Default |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `--cloak`          | Use CloakBrowser stealth-patched Chromium instead of system Chrome. Enables its platform-specific source-level fingerprint patches. Binary auto-downloads (~200MB) on first use. Identity is persisted per profile. See [docs/cloak.en.md](docs/cloak.en.md).                                         | `false` |
+| `--isolated`       | Use a temporary user data directory (cookies/localStorage not persisted, auto-cleaned on close)                                                                                                                                                                                                       | `false` |
+| `--browserUrl, -u` | Connect to a running Chrome instance via CDP HTTP endpoint (e.g. `http://127.0.0.1:9222`). The MCP probes it to find the WebSocket debugger URL. See [docs/cdp-endpoint.en.md](docs/cdp-endpoint.en.md) for how to obtain this endpoint from local Chrome, AdsPower, BitBrowser, etc.                 | –       |
+| `--logFile`        | Write MCP diagnostics to a `0600` regular file. Use only `DEBUG=mcp:*` for verbose logs; never `DEBUG=*`, because browser protocol logs may expose page data, cookies, scripts, and credentials.                                                                                                      | –       |
+| `--allowedRoots`   | Repeatable list of local directories the Agent may read or write. Real paths are pinned and symlink escapes are rejected. While enabled, `file:`, `view-source:file:`, and `filesystem:file:` browser pages are disabled. If omitted, local-file access is unrestricted and startup prints a warning. | –       |
 
 ### Example Configurations
 
@@ -352,7 +355,7 @@ If a site blocks you (e.g. Zhihu returning error 40362, Cloudflare challenge loo
    ```json
    "args": ["js-reverse-mcp", "--isolated"]
    ```
-2. **If that doesn't help, enable `--cloak`** — adds 49 source-level fingerprint patches:
+2. **If that doesn't help, enable `--cloak`** — enables its platform-specific source-level fingerprint patches:
    ```json
    "args": ["js-reverse-mcp", "--cloak"]
    ```
@@ -366,6 +369,8 @@ See [docs/cloak.en.md](docs/cloak.en.md) for when `--cloak` is the right call (a
 ## Security Notice
 
 This tool exposes browser content to MCP clients, allowing inspection, debugging, and modification of any data in the browser. Do not use it on pages containing sensitive information.
+
+`evaluate_script.localFilePath` and the various `outputFile`/`filePath` parameters let the MCP process read or write host files. In production or shared environments, pass one or more `--allowedRoots` flags for a dedicated workspace; without them, local-file access is unrestricted. When `--allowedRoots` is enabled, `file:`, `view-source:file:`, and `filesystem:file:` browser pages are also rejected so browser navigation cannot bypass the directory boundary. To debug local pages, use a separate session without this option only when you explicitly accept local-file exposure.
 
 ## License
 

@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {zod} from '../third_party/index.js';
+import {ToolError} from '../ToolError.js';
+
 import {ToolCategory} from './categories.js';
 import {defineTool} from './ToolDefinition.js';
 
@@ -38,17 +41,40 @@ function formatCookieScope(cookie: {
 
 export const clearSiteData = defineTool({
   name: 'clear_site_data',
-  description: `Clear browser state to create a clean replay environment for the currently selected page. This clears cookies that affect the current page's HTTP(S) frame URLs, clears browser HTTP cache, clears persistent storage for the current page's HTTP(S) frame origins, and clears sessionStorage in current page HTTP(S) frames. This tool does not reload the page. Cookie cleanup is scoped by cookie domain/path matching for the current page frames, not by all cookies in the browser context.`,
+  description: `Clear browser state after confirm=true to create a clean replay environment for the selected page. This clears cookies affecting its HTTP(S) frames, persistent storage for those origins, and frame sessionStorage. It does not reload. Browser HTTP cache is global and preserved by default; opt in with clearBrowserCache only when that wider effect is intended.`,
   annotations: {
     category: ToolCategory.BROWSER_STATE,
     readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
   },
-  schema: {},
-  handler: async (_request, response, context) => {
+  schema: {
+    confirm: zod
+      .boolean()
+      .default(false)
+      .describe(
+        'Must be true to confirm deletion of cookies and origin storage for the selected page frames.',
+      ),
+    clearBrowserCache: zod
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        'Also clear the browser-wide HTTP cache. This affects every page and origin in the browser, not only the selected site.',
+      ),
+  },
+  handler: async (request, response, context) => {
+    if (!request.params.confirm) {
+      throw new ToolError(
+        'CONFIRMATION_REQUIRED',
+        'clear_site_data requires confirm=true because cookies and site storage cannot be restored.',
+      );
+    }
     const debugger_ = context.debuggerContext;
     if (debugger_.isEnabled() && debugger_.isPaused()) {
-      throw new Error(
-        'Execution is paused at a breakpoint. clear_site_data needs page JavaScript to clear sessionStorage, which cannot complete while execution is paused. Resume execution with pause_or_resume, then retry clear_site_data.',
+      throw new ToolError(
+        'PRECONDITION_FAILED',
+        'Execution is paused at a breakpoint. clear_site_data needs page JavaScript to clear sessionStorage, which cannot complete while execution is paused. Resume with pause_or_resume(action="resume"), then retry clear_site_data.',
       );
     }
 
@@ -57,7 +83,8 @@ export const clearSiteData = defineTool({
     const url = new URL(pageUrl);
 
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-      throw new Error(
+      throw new ToolError(
+        'PRECONDITION_FAILED',
         `clear_site_data requires an http(s) selected page. Current URL is ${pageUrl}. Navigate to the target site first.`,
       );
     }
@@ -82,7 +109,7 @@ export const clearSiteData = defineTool({
     let cookieDomains: string[] = [];
     let cookieNames: string[] = [];
     let cookiesStatus = 'failed';
-    let browserCacheStatus = 'failed';
+    let browserCacheStatus = 'no (not requested; browser-wide cache preserved)';
     let originStorageStatus = `failed`;
     let sessionStorageStatus = 'failed';
     const clearedStorageOrigins: string[] = [];
@@ -147,13 +174,16 @@ export const clearSiteData = defineTool({
     });
 
     if (session) {
-      try {
-        await session.send('Network.clearBrowserCache');
-        browserCacheStatus = 'yes';
-      } catch (error) {
-        warnings.push(
-          `Failed to clear browser HTTP cache: ${error instanceof Error ? error.message : String(error)}`,
-        );
+      if (request.params.clearBrowserCache) {
+        try {
+          await session.send('Network.clearBrowserCache');
+          browserCacheStatus = 'yes (browser-wide)';
+        } catch (error) {
+          browserCacheStatus = 'failed';
+          warnings.push(
+            `Failed to clear browser HTTP cache: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
       }
 
       try {
@@ -270,5 +300,17 @@ export const clearSiteData = defineTool({
     response.appendResponseLine(
       'The page was not reloaded. Use navigate_page({type:"reload"}) to replay cookie generation.',
     );
+    response.setStructuredContent({
+      origin: url.origin,
+      url: pageUrl,
+      cookieScopesCleared: clearedCookieScopes.length,
+      cookieScopesFailed: failedCookieScopes.length,
+      browserCacheCleared: browserCacheStatus.startsWith('yes'),
+      storageOriginsCleared: clearedStorageOrigins,
+      storageOriginsFailed: failedStorageOrigins,
+      sessionStorageFramesCleared: clearedSessionStorageFrames,
+      sessionStorageFramesFailed: failedSessionStorageFrames,
+      warnings,
+    });
   },
 });

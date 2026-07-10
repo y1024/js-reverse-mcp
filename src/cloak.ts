@@ -5,12 +5,23 @@
  */
 
 import {randomInt} from 'node:crypto';
-import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  fstatSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'node:fs';
 import path from 'node:path';
 
 interface CloakBrowserModule {
   ensureBinary(): Promise<string>;
   binaryInfo(): {installed: boolean};
+  getDefaultStealthArgs(): string[];
 }
 
 async function loadCloakBrowser(): Promise<CloakBrowserModule> {
@@ -49,25 +60,52 @@ async function withStdoutRedirectedToStderr<T>(
   }
 }
 
-function getOrCreateSeed(profileDir: string): number {
+export function getOrCreateSeed(profileDir: string): number {
+  mkdirSync(profileDir, {recursive: true, mode: 0o700});
   const seedFile = path.join(profileDir, '.cloak-seed');
-  if (existsSync(seedFile)) {
-    const parsed = Number.parseInt(readFileSync(seedFile, 'utf8').trim(), 10);
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      seedFile,
+      fsConstants.O_RDWR |
+        fsConstants.O_CREAT |
+        fsConstants.O_NOFOLLOW |
+        fsConstants.O_NONBLOCK,
+      0o600,
+    );
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(
+        `Cloak fingerprint seed is not a regular file: ${seedFile}`,
+      );
+    }
+    fchmodSync(fd, 0o600);
+    const parsed = Number.parseInt(readFileSync(fd, 'utf8').trim(), 10);
     if (Number.isFinite(parsed)) {
       return parsed;
     }
+    const seed = randomInt(10000, 100000);
+    ftruncateSync(fd, 0);
+    writeSync(fd, String(seed), 0, 'utf8');
+    return seed;
+  } finally {
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
   }
-  if (!existsSync(profileDir)) {
-    mkdirSync(profileDir, {recursive: true});
-  }
-  const seed = randomInt(10000, 100000);
-  writeFileSync(seedFile, String(seed), 'utf8');
-  return seed;
 }
 
 export interface CloakSetup {
   executablePath: string;
   args: string[];
+}
+
+export function buildCloakArgs(defaultArgs: readonly string[], seed: number) {
+  return [
+    ...defaultArgs.filter(
+      arg => arg !== '--no-sandbox' && !arg.startsWith('--fingerprint='),
+    ),
+    `--fingerprint=${seed}`,
+  ];
 }
 
 /**
@@ -99,33 +137,11 @@ export async function setupCloak(
     ? getOrCreateSeed(profileDir)
     : randomInt(10000, 100000);
 
-  // ALWAYS spoof as Windows desktop — even on macOS.
-  //
-  // Reason: CloakBrowser ships 57 C++ fingerprint patches for Linux/Windows
-  // platform builds but only 26 for macOS (per cloak's own README — the macOS
-  // build leaves real GPU strings and several other signals untouched because
-  // the small pool of real Mac GPUs makes spoofed values *more* detectable
-  // than real ones in their target scraping scenarios).
-  //
-  // For this MCP's use case (debugging strong anti-bot sites), the full
-  // Windows-profile spoof is strictly better — it activates all 57 patches
-  // and reports a generic Windows desktop fingerprint that anti-bot databases
-  // see by the millions.
-  //
-  // CloakBrowser's own troubleshooting (README §"macOS: Blocked on some sites
-  // that pass on Linux") explicitly recommends this when macOS profile gets
-  // blocked: "switch to a Windows fingerprint profile by passing
-  // stealth_args=False and manually setting --fingerprint-platform=windows".
-  const platform = 'windows';
-
-  // NOTE: We intentionally do NOT include `--no-sandbox` here even though
-  // CloakBrowser's getDefaultStealthArgs adds it. Their default targets
-  // Docker/Linux-CI use cases where the setuid sandbox helper isn't available.
-  // This MCP is a desktop debugging tool — the OS sandbox works fine,
-  // and `--no-sandbox` triggers Chrome's "unsupported command-line flag"
-  // infobar that hangs over every tab.
+  // Follow the current CloakBrowser platform profile and future stealth flags,
+  // but keep this desktop debugging server sandboxed and replace the random
+  // upstream fingerprint with our profile-stable seed.
   return {
     executablePath,
-    args: [`--fingerprint=${seed}`, `--fingerprint-platform=${platform}`],
+    args: buildCloakArgs(cloak.getDefaultStealthArgs(), seed),
   };
 }
